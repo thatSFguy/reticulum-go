@@ -267,6 +267,13 @@ type LinkManager struct {
 	// DATA. Default no-op.
 	defaultOnInboundData func(linkID, plaintext []byte)
 
+	// Optional manager-level callback for fully-assembled inbound
+	// Resource bodies on links that have no per-link OnInboundData set.
+	// Mirrors defaultOnInboundData for small DATA: the receiver prefers
+	// the per-link handler and falls back to this one, which carries the
+	// link_id so an application can route the body to the right session.
+	defaultOnResourceAssembled func(linkID, body []byte)
+
 	// senders / receivers index in-flight Resource transfers per link
 	// keyed by hex(link_id) || hex(resource_hash) so the Transport
 	// dispatcher can route inbound RESOURCE_REQ / RESOURCE_PRF /
@@ -417,6 +424,25 @@ func (lm *LinkManager) SetDefaultInboundDataHandler(cb func(linkID, plaintext []
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	lm.defaultOnInboundData = cb
+}
+
+// SetResourceAssembledHandler sets a fallback callback for fully-assembled
+// inbound Resource bodies on links that have no per-link OnInboundData set.
+// The per-link handler still takes precedence; this manager-level handler
+// carries the link_id so an application can route the reassembled body to
+// the right session.
+func (lm *LinkManager) SetResourceAssembledHandler(cb func(linkID, body []byte)) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lm.defaultOnResourceAssembled = cb
+}
+
+// resourceAssembledHandler returns the manager-level assembled-resource
+// callback under lock, or nil if none is set.
+func (lm *LinkManager) resourceAssembledHandler() func(linkID, body []byte) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.defaultOnResourceAssembled
 }
 
 // Get returns the Link with the given link_id, or nil if unknown.

@@ -168,6 +168,8 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		OnAssembled: func(body []byte) {
 			if cb != nil {
 				cb(body)
+			} else if h := t.linkManager.resourceAssembledHandler(); h != nil {
+				h(link.ID, body)
 			}
 		},
 	}
