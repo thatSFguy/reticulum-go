@@ -1,0 +1,75 @@
+name: spec-watch
+
+# This implementation tracks thatSFguy/reticulum-specifications.
+# SPEC_VERSION at the repo root pins the spec commit the code was last
+# synced against. Nightly, compare that pin to upstream master and keep
+# a single open `spec-sync` issue listing what has landed since — a flag
+# that a sync may be needed, not a gate. Close the loop by bumping
+# SPEC_VERSION and closing the issue once the code has caught up (or no
+# change turned out to be needed).
+on:
+  schedule:
+    - cron: "47 4 * * *" # nightly, after the fuzz run
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SPEC_REPO: thatSFguy/reticulum-specifications
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compare pinned spec against upstream
+        run: |
+          pinned=$(tr -d '[:space:]' < SPEC_VERSION)
+          latest=$(gh api "repos/$SPEC_REPO/commits/master" --jq .sha)
+          echo "pinned:   $pinned"
+          echo "upstream: $latest"
+          if [ "$latest" = "$pinned" ]; then
+            echo "In sync; nothing to do."
+            exit 0
+          fi
+
+          # The compare call fails if the pinned SHA was rewritten out of
+          # upstream history; still raise the flag, just without the list.
+          gh api "repos/$SPEC_REPO/compare/$pinned...$latest" \
+            --jq '.commits[] | "- [`\(.sha[0:7])`](\(.html_url)) \(.commit.message | split("\n")[0])"' \
+            > commits.md \
+            || echo "- (unable to list commits — pinned SHA no longer in upstream history)" > commits.md
+
+          {
+            echo "Upstream spec repo [\`$SPEC_REPO\`](https://github.com/$SPEC_REPO) has moved past the pinned \`SPEC_VERSION\`."
+            echo
+            echo "Pinned: \`$pinned\`"
+            echo "Upstream \`master\`: \`$latest\`"
+            echo
+            echo "New spec commits:"
+            cat commits.md
+            echo
+            echo "Full diff: https://github.com/$SPEC_REPO/compare/$pinned...$latest"
+            echo
+            echo "When the implementation has caught up (or no code change is needed), bump \`SPEC_VERSION\` to \`$latest\` and close this issue."
+            echo
+            echo "_Kept current nightly by the spec-watch workflow; last checked $(date -u +%Y-%m-%dT%H:%M:%SZ)._"
+          } > body.md
+
+          gh label create spec-sync \
+            --description "Upstream spec moved past SPEC_VERSION" \
+            --color D93F0B --force 2>/dev/null || true
+
+          existing=$(gh issue list --label spec-sync --state open \
+            --json number --jq '.[0].number // empty')
+          title="Spec sync needed: upstream at ${latest:0:7}, pinned at ${pinned:0:7}"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body-file body.md
+            echo "Updated issue #$existing"
+          else
+            gh issue create --title "$title" --label spec-sync --body-file body.md
+          fi
