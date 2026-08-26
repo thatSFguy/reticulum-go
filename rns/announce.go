@@ -302,6 +302,62 @@ func DecodeLXMFAppDataDisplayName(data []byte) ([]byte, error) {
 	return data, nil
 }
 
+// DecodeLXMFAppDataStampCost extracts the stamp_cost an LXMF delivery
+// destination announces in element [1] of its app_data (SPEC §4.3 /
+// §5.7.4) — "you must do this much proof-of-work to message me".
+//
+// Returns 0 for every shape that carries no demand: empty app_data, the
+// legacy raw-UTF8 display-name form, a 1-element array, or an explicit
+// msgpack nil. Those are indistinguishable in effect and all mean "no
+// stamp required".
+//
+// An element [1] that is present but not a non-negative integer is an
+// error rather than a silent 0: the peer is announcing something about
+// its stamp policy that we failed to understand, and treating that as
+// "no stamp" is how a sender ends up silently dropped by a recipient
+// that enforces stamps (§5.7.4).
+func DecodeLXMFAppDataStampCost(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	var arr []msgpack.RawMessage
+	if err := safeUnmarshalAnnounce(data, &arr); err != nil {
+		// Legacy raw-UTF8 announce (name only, no stamp field).
+		return 0, nil
+	}
+	if len(arr) < 2 {
+		return 0, nil
+	}
+	// A nil element decodes to an empty RawMessage under this msgpack
+	// library, so both shapes mean "announced, but no demand".
+	if len(arr[1]) == 0 || arr[1][0] == msgpackNilByte {
+		return 0, nil
+	}
+	var cost int64
+	if err := safeUnmarshalAnnounce(arr[1], &cost); err != nil {
+		return 0, fmt.Errorf("app_data: stamp_cost is not an integer: %w", err)
+	}
+	// A stamp_cost is a leading-zero-bit target for a SHA-256 digest, so
+	// the satisfiable range is [0, 256]. Outside it the announce is
+	// malformed rather than merely expensive: no stamp can ever clear 300
+	// bits, so passing the number through would hand callers a value that
+	// only looks like a cost. (Found by FuzzDecodeLXMFAppDataStampCost,
+	// which reached 2^61 through a uint64 envelope.) Costs that are
+	// satisfiable but more work than we will do are a separate decision,
+	// made against lxmf.MaxDeliveryStampCost at grind time.
+	if cost < 0 || cost > stampCostBits {
+		return 0, fmt.Errorf("app_data: stamp_cost %d outside the satisfiable range [0, %d]", cost, stampCostBits)
+	}
+	return int(cost), nil
+}
+
+// msgpackNilByte is the msgpack format byte for nil.
+const msgpackNilByte = 0xc0
+
+// stampCostBits is the widest meaningful stamp_cost: a cost counts
+// leading zero bits of a SHA-256 digest, which has 256 of them.
+const stampCostBits = 256
+
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false

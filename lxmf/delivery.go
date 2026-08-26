@@ -106,6 +106,24 @@ type Delivery struct {
 	// the pre-v1.13 behavior, kept for tests and for callers that do
 	// their own confirmation.
 	DeliveryProofTimeout time.Duration
+
+	// DisableOutboundStamps turns off §5.7 delivery-stamp generation.
+	//
+	// By default an outbound message carries a stamp whenever the
+	// recipient's announce asks for one (§5.7.4) — that is what makes us
+	// deliverable to a recipient who enforces stamps. The cost is that
+	// Send BLOCKS on proof-of-work: a 768 KiB workblock plus ~2^cost
+	// hashes, per message per recipient. Set this when the caller would
+	// rather be fast and possibly filtered than slow and accepted (a
+	// latency-critical path, a constrained device, a test).
+	DisableOutboundStamps bool
+
+	// MaxStampCost overrides MaxDeliveryStampCost for this Delivery —
+	// the ceiling past which an announced stamp_cost is refused with
+	// ErrStampCostTooHigh instead of ground. 0 = the package default.
+	// Lower it on constrained hardware; raise it only if you have a
+	// concrete peer demanding more and CPU to burn.
+	MaxStampCost int
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -170,9 +188,44 @@ func (d *Delivery) Identity() *rns.Identity { return d.identity }
 // X25519 public key to encrypt opportunistically and their long-term
 // Ed25519 public key to verify the LRPROOF + link DATA proofs. An
 // unknown recipient yields an error before any wire activity.
+//
+// If that announce declares a stamp_cost (SPEC §4.3 / §5.7.4), Send also
+// grinds a §5.7.2 delivery stamp before transmitting — proof-of-work
+// that BLOCKS the call for roughly 2^cost hashes over a 768 KiB
+// workblock. Set DisableOutboundStamps to skip it (at the cost of being
+// dropped or flagged by recipients that enforce stamps), or MaxStampCost
+// to lower the ceiling past which an announced cost is refused with
+// ErrStampCostTooHigh.
 func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields map[any]any) error {
 	_, err := d.SendWithID(recipientDestHash, title, content, fields)
 	return err
+}
+
+// stampOptionsFor resolves the §5.7 stamp policy for one recipient from
+// the app_data of their most recent announce (§4.3 element [1]).
+//
+// A malformed app_data is NOT fatal: the peer garbled its own announce,
+// and refusing to message them over it would be a peer's bug taking down
+// our send path. We fall back to "no stamp" and report the decode error
+// through OnError so it is visible rather than silent — the message may
+// well be dropped on arrival if that peer actually enforces stamps.
+//
+// A cost we understand but refuse to grind is a different matter and
+// surfaces as an error from the pack call (ErrStampCostTooHigh): there
+// the recipient stated a demand and we are declining it, which the
+// caller needs to know about.
+func (d *Delivery) stampOptionsFor(appData []byte) StampOptions {
+	if d.DisableOutboundStamps {
+		return StampOptions{}
+	}
+	cost, err := rns.DecodeLXMFAppDataStampCost(appData)
+	if err != nil {
+		if d.OnError != nil {
+			d.OnError(fmt.Errorf("stamp_cost from announce app_data: %w", err))
+		}
+		return StampOptions{}
+	}
+	return StampOptions{Cost: cost, MaxCost: d.MaxStampCost}
 }
 
 // SendWithID is Send but also returns the 32-byte LXMF message_id the
@@ -190,14 +243,20 @@ func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, f
 		return nil, fmt.Errorf("%w: %x", ErrRecipientUnknown, recipientDestHash[:4])
 	}
 
-	// Try opportunistic first. signAndPackOpportunisticAt fails fast with
-	// ErrPayloadTooLarge before doing any crypto if the payload won't
-	// fit, so this branch costs at most one msgpack marshal for messages
-	// that route to link delivery.
-	body, packedID, err := SignAndPackOpportunistic(d.identity, d.destHash, recipientDestHash, title, content, fields)
+	// Stamp policy comes from the recipient's own announce (§5.7.4), so
+	// it is resolved once here and reused by whichever route we take —
+	// re-deriving it inside sendOverLink would grind the proof-of-work a
+	// second time for every message that overflows the packet cap.
+	opts := d.stampOptionsFor(known.AppData)
+
+	// Try opportunistic first. The size check runs on the STAMPED payload
+	// (a stamp costs 34 bytes of the 295-byte budget), so a stamped
+	// message near the cap correctly routes to link delivery instead of
+	// being emitted as a packet upstream would have sent as a Resource.
+	body, packedID, err := SignAndPackOpportunisticStamped(d.identity, d.destHash, recipientDestHash, title, content, fields, opts)
 	if err != nil {
 		if errors.Is(err, ErrPayloadTooLarge) {
-			return d.sendOverLink(recipientDestHash, title, content, fields)
+			return d.sendOverLink(recipientDestHash, title, content, fields, opts)
 		}
 		return nil, fmt.Errorf("pack: %w", err)
 	}
@@ -263,8 +322,8 @@ func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, f
 // blocks for the responder's proof. Returns the LXMF message_id alongside
 // the error so SendWithID can register the recipient view for cross-
 // client reaction / reply rewriting.
-func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields map[any]any) (msgID []byte, err error) {
-	directBody, packedID, err := SignAndPackDirect(d.identity, d.destHash, recipientDestHash, title, content, fields)
+func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields map[any]any, opts StampOptions) (msgID []byte, err error) {
+	directBody, packedID, err := SignAndPackDirectStamped(d.identity, d.destHash, recipientDestHash, title, content, fields, opts)
 	if err != nil {
 		return nil, fmt.Errorf("pack direct: %w", err)
 	}
@@ -318,10 +377,16 @@ func (d *Delivery) SendPropagated(nodeDestHash, recipientDestHash []byte, title,
 		return nil, fmt.Errorf("%w: %x", ErrPropagationNodeDisabled, nodeDestHash[:4])
 	}
 
-	lxmfData, transientID, packedID, err := SignAndPackPropagated(
+	// Two independent stamps, two different audiences: the recipient's
+	// delivery stamp (§5.7.2, ground over message_id, sealed inside the
+	// payload) travels with the message to its destination, while the
+	// node's propagation stamp below only buys storage. Skipping the
+	// first would hand a stamp-enforcing recipient a message they drop
+	// after it survived the whole store-and-forward trip.
+	lxmfData, transientID, packedID, err := SignAndPackPropagatedStamped(
 		d.identity, d.destHash, recipientDestHash,
 		recipient.X25519Public(), identityHashFromPublic(recipient.PublicKey),
-		title, content, fields)
+		title, content, fields, d.stampOptionsFor(recipient.AppData))
 	if err != nil {
 		return nil, fmt.Errorf("pack propagated: %w", err)
 	}

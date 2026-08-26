@@ -32,6 +32,14 @@ type pnFixture struct {
 }
 
 func newPNFixture(t *testing.T, pnAppData []byte) *pnFixture {
+	return newPNFixtureWithRecipientCost(t, pnAppData, nil)
+}
+
+// newPNFixtureWithRecipientCost is newPNFixture with control over the
+// stamp_cost BOB announces (§4.3 element [1]) — distinct from the cost
+// the NODE announces in pnAppData. A propagated message can need both:
+// one stamp to be stored, another to be accepted on arrival.
+func newPNFixtureWithRecipientCost(t *testing.T, pnAppData []byte, bobStampCost *int) *pnFixture {
 	t.Helper()
 	alice, _ := rns.NewIdentity()
 	bob, _ := rns.NewIdentity()
@@ -86,7 +94,7 @@ func newPNFixture(t *testing.T, pnAppData []byte) *pnFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bobAppData, _ := rns.EncodeLXMFAppData([]byte("bob"), nil)
+	bobAppData, _ := rns.EncodeLXMFAppData([]byte("bob"), bobStampCost)
 	bobPkt, err := rns.BuildAnnounce(bob, FullName(), bobAppData, nil)
 	if err != nil {
 		t.Fatal(err)

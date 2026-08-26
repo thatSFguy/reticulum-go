@@ -1,9 +1,15 @@
 // Package lxmf is a minimal-viable LXMF implementation built on top of the
 // pure-Go rns package. It implements opportunistic single-packet delivery
 // (SPEC §5.1), direct (Link) delivery (SPEC §5.2), and sender-side
-// propagation-node submission (SPEC §5.8) including outbound propagation
-// stamps (SPEC §5.7). Tickets and the propagation-node *server* role are
-// intentionally out of scope.
+// propagation-node submission (SPEC §5.8).
+//
+// Outbound stamps (SPEC §5.7) are generated in both flavors: delivery
+// stamps for recipients whose announce declares a stamp_cost, and
+// propagation stamps for nodes that declare one. Inbound stamps are
+// parsed and stripped for signature verification but never validated —
+// the "PoW outbound, tolerate-but-don't-validate inbound" interop
+// minimum of §5.7.4. Tickets (§5.7.3) and the propagation-node *server*
+// role are intentionally out of scope.
 package lxmf
 
 import (
@@ -121,7 +127,20 @@ type Message struct {
 // they parse this body — used by the forwarder to register per-recipient
 // IDs for cross-client reaction / reply rewriting.
 func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) (wire, msgID []byte, err error) {
-	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
+	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now(), StampOptions{})
+}
+
+// SignAndPackOpportunisticStamped is SignAndPackOpportunistic with a
+// §5.7 delivery stamp attached when opts.Cost > 0 — for recipients whose
+// announce app_data declares a stamp_cost (§5.7.4). Blocks for the grind
+// (expected 2^Cost hashes over a 768 KiB workblock) and fails with
+// ErrStampCostTooHigh rather than grinding past opts.MaxCost.
+//
+// The stamp lands inside the single-packet budget, so a message that fits
+// unstamped may return ErrPayloadTooLarge once stamped; the caller routes
+// it to link delivery exactly as it would any other oversize message.
+func SignAndPackOpportunisticStamped(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, opts StampOptions) (wire, msgID []byte, err error) {
+	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now(), opts)
 }
 
 // SignAndPackDirect builds the link-form (direct) LXMF body bytes for
@@ -134,11 +153,19 @@ func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash [
 // destination). No size cap is enforced here — link DATA can carry
 // arbitrary-size payloads, fragmented by the link layer.
 func SignAndPackDirect(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) (wire, msgID []byte, err error) {
-	return signAndPackDirectAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
+	return signAndPackDirectAt(senderID, senderDestHash, destHash, title, content, fields, time.Now(), StampOptions{})
 }
 
-func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
-	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
+// SignAndPackDirectStamped is SignAndPackDirect with a §5.7 delivery
+// stamp attached when opts.Cost > 0. Same grind semantics as
+// SignAndPackOpportunisticStamped, minus the size cap — link DATA has no
+// single-packet budget for the stamp to eat into.
+func SignAndPackDirectStamped(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, opts StampOptions) (wire, msgID []byte, err error) {
+	return signAndPackDirectAt(senderID, senderDestHash, destHash, title, content, fields, time.Now(), opts)
+}
+
+func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time, opts StampOptions) (wire, msgID []byte, err error) {
+	payload, sig, id, err := packSignedAndStamped(senderID, senderDestHash, destHash, title, content, fields, ts, opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -156,11 +183,14 @@ func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte
 // (which pin the timestamp) can be reproduced exactly. The returned
 // msgID is the recipient-view LXMF message_id (independent of signature
 // — it's just H(dest||source||payload)).
-func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
-	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
+func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time, opts StampOptions) (wire, msgID []byte, err error) {
+	payload, sig, id, err := packSignedAndStamped(senderID, senderDestHash, destHash, title, content, fields, ts, opts)
 	if err != nil {
 		return nil, nil, err
 	}
+	// The stamp counts against the single-packet budget: upstream picks
+	// PACKET vs RESOURCE representation from the STAMPED size, so a
+	// message that only fits unstamped must still route to a link.
 	if len(payload) > MaxOpportunisticPayload {
 		return nil, nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
 			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
@@ -171,6 +201,84 @@ func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash
 	out = append(out, sig...)
 	out = append(out, payload...)
 	return out, id, nil
+}
+
+// StampOptions controls outbound §5.7.2 delivery-stamp generation for one
+// packed message. The zero value means "no stamp", which is what every
+// pre-stamp call site gets.
+type StampOptions struct {
+	// Cost is the required leading-zero bit count, taken from element [1]
+	// of the recipient's announce app_data (§4.3 / §5.7.4). Zero or
+	// negative means the recipient asks for no stamp.
+	Cost int
+
+	// MaxCost refuses to grind past this many bits. Zero means
+	// MaxDeliveryStampCost. See that constant for why a cap is mandatory
+	// on a stranger-supplied cost.
+	MaxCost int
+}
+
+func (o StampOptions) maxCost() int {
+	if o.MaxCost > 0 {
+		return o.MaxCost
+	}
+	return MaxDeliveryStampCost
+}
+
+// packSignedAndStamped is the shared core of every outbound pack variant.
+// It marshals and signs the 4-element payload, then — if opts asks for a
+// stamp — grinds one over the message_id and splices it in as element
+// [4] (§5.7.1).
+//
+// The returned sig and msgID always correspond to the FOUR-element
+// payload, even when the returned payload has five: that is the whole
+// point of the §5.6 strip-and-reverify rule, and it keeps message_id
+// stable whether or not a stamp is attached (§5.5).
+func packSignedAndStamped(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time, opts StampOptions) (payload, sig, msgID []byte, err error) {
+	payload, sig, msgID, err = buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if opts.Cost <= 0 {
+		return payload, sig, msgID, nil
+	}
+	stamp, err := generateStamp(msgID, opts.Cost, workblockExpandRounds, opts.maxCost())
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	stamped, err := appendStamp(payload, stamp)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return stamped, sig, msgID, nil
+}
+
+// appendStamp turns a signed 4-element payload into the 5-element
+// stamped form of §5.7.1.
+//
+// It SPLICES rather than re-marshalling, for the same reason
+// reencodeFirstFour does: elements [0..3] must come back byte-identical
+// when the recipient strips the stamp and re-encodes for §5.6 variant-2
+// verification. Re-marshalling a Go fields map is order-nondeterministic,
+// so a re-marshalled 5-element payload would verify only by luck on any
+// message with more than one field. Bumping the fixarray header 0x94 ->
+// 0x95 and appending the stamp leaves the signed bytes untouched.
+func appendStamp(payload, stamp []byte) ([]byte, error) {
+	if len(stamp) != StampSize {
+		return nil, fmt.Errorf("stamp must be %d bytes, got %d", StampSize, len(stamp))
+	}
+	if len(payload) == 0 || payload[0] != 0x94 {
+		return nil, errors.New("payload is not a 4-element msgpack fixarray")
+	}
+	encoded, err := msgpack.Marshal(stamp)
+	if err != nil {
+		return nil, fmt.Errorf("marshal stamp: %w", err)
+	}
+	out := make([]byte, 0, len(payload)+len(encoded))
+	out = append(out, 0x95) // fixarray, 5 elements
+	out = append(out, payload[1:]...)
+	out = append(out, encoded...)
+	return out, nil
 }
 
 // buildSignedPayload is the shared core of every outbound pack variant:
@@ -289,6 +397,11 @@ func (m *Message) Verify(senderEd25519Pub []byte) error {
 // wrapping ErrPayloadTooLarge if not. It does the msgpack marshal but no
 // crypto and no network I/O — safe to call as a pre-check before iterating
 // recipients.
+//
+// It answers for the UNSTAMPED form. A §5.7 stamp adds 34 bytes to the
+// payload, so a message that passes here may still route to link delivery
+// for a recipient who demands one — which is per-recipient information
+// this call deliberately does not take.
 func CheckOpportunisticSize(title, content []byte, fields map[any]any) error {
 	if title == nil {
 		title = []byte{}
@@ -349,8 +462,21 @@ func ComputeMessageID(destHash, sourceHash, msgpackPayload []byte) []byte {
 // replays — see DedupKey. It remains the correct identifier for
 // reply-to / reaction binding, because that is what peer clients
 // compute and reference.
+//
+// For a STAMPED message the hash covers the first four payload elements
+// only (SPEC §5.5), not the 5-element array on the wire. Hashing the
+// stamp too would make message_id depend on the sender's proof-of-work,
+// so the id our own SignAndPack*Stamped returned would not match the one
+// the recipient derives — and every reaction or reply either side binds
+// to it would miss.
 func (m *Message) MessageID() []byte {
-	return ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
+	payload := m.rawPayload
+	if m.Stamp != nil {
+		if stripped, err := reencodeFirstFour(payload); err == nil {
+			payload = stripped
+		}
+	}
+	return ComputeMessageID(m.DestHash, m.SourceHash, payload)
 }
 
 // DedupKey returns a replay-resistant identity for a VERIFIED inbound
