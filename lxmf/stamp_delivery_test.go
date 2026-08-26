@@ -304,3 +304,80 @@ func TestStampOptionsMaxCost(t *testing.T) {
 		t.Errorf("err = %v, want ErrStampCostTooHigh", err)
 	}
 }
+
+// TestOversizeStampedMessageDoesNotGrind is the regression for a wasted
+// proof-of-work: the opportunistic packer used to grind, then discover
+// the stamped payload overflowed the single-packet budget, and return
+// ErrPayloadTooLarge — whereupon Delivery.SendWithID re-packed through
+// sendOverLink and ground a second time over a fresh message_id. Every
+// oversize message to a stamp-demanding recipient paid twice.
+//
+// The size is knowable from the unstamped payload, so the refusal must
+// come back far faster than a grind at a cost this high could.
+func TestOversizeStampedMessageDoesNotGrind(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	destHash := bytes.Repeat([]byte{0x77}, rns.IdentityHashLen)
+	content := bytes.Repeat([]byte{'x'}, MaxOpportunisticPayload)
+
+	start := time.Now()
+	_, _, err := SignAndPackOpportunisticStamped(sender, senderDest, destHash,
+		nil, content, nil, StampOptions{Cost: MaxDeliveryStampCost})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrPayloadTooLarge) {
+		t.Fatalf("err = %v, want ErrPayloadTooLarge", err)
+	}
+	// A grind at MaxDeliveryStampCost measures in the hundreds of
+	// milliseconds, and building the workblock alone is tens. Refusing
+	// without touching either is microseconds; 10ms separates them by
+	// more than an order of magnitude either way.
+	if elapsed > 10*time.Millisecond {
+		t.Errorf("oversize refusal took %v — proof-of-work was done before the size check", elapsed)
+	}
+}
+
+// TestStampElementStrippedEvenWhenUndecodable: a peer can emit a
+// 5-element payload whose element [4] is not readable as bytes (msgpack
+// nil, or a str). Message.Stamp is then nil, but the payload is still
+// the 5-element form, so both the §5.5 message_id and the §5.6 variant-2
+// signature retry must strip it. Keying either on Stamp != nil made such
+// a message compute an id no other client agrees with, and fail
+// verification outright.
+func TestStampElementStrippedEvenWhenUndecodable(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	destHash := bytes.Repeat([]byte{0x88}, rns.IdentityHashLen)
+
+	body, msgID, err := SignAndPackOpportunistic(sender, senderDest, destHash,
+		nil, []byte("null stamp"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := ParseOpportunisticBody(body, destHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-pack the payload as a 5-element array with a msgpack-nil stamp.
+	stamped := append([]byte{0x95}, base.rawPayload[1:]...)
+	stamped = append(stamped, msgpackNil)
+	mutated := append(append([]byte{}, body[:rns.IdentityHashLen+signatureLen]...), stamped...)
+
+	m, err := ParseOpportunisticBody(mutated, destHash)
+	if err != nil {
+		t.Fatalf("5-element payload with a nil stamp did not parse: %v", err)
+	}
+	if m.Stamp != nil {
+		t.Fatalf("premise broken — a nil stamp should not decode to bytes, got %x", m.Stamp)
+	}
+	if !m.stampElement {
+		t.Fatal("stampElement not set for a 5-element payload")
+	}
+	if err := m.Verify(sender.PublicKey()[32:]); err != nil {
+		t.Errorf("Verify did not strip an undecodable stamp element: %v", err)
+	}
+	if !bytes.Equal(m.MessageID(), msgID) {
+		t.Errorf("message_id %x != unstamped %x — element [4] was hashed", m.MessageID(), msgID)
+	}
+}

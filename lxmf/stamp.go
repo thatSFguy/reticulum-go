@@ -64,13 +64,19 @@ const (
 
 	// MaxDeliveryStampCost is the same guard for §5.7.2 delivery stamps,
 	// whose cost comes from element [1] of the recipient's own announce
-	// app_data (§4.3) — equally stranger-controlled, and worse per unit
-	// of cost: the 3000-round workblock is 3x the propagation one, so
-	// every grind attempt walks 768 KiB. Real-world stamp_cost values are
-	// 0-8; anything past this cap is refused outright (ErrStampCostTooHigh
-	// out of Send) rather than silently sent unstamped, because a
-	// recipient enforcing stamps would drop the unstamped message anyway
-	// and the caller deserves to know why.
+	// app_data (§4.3) — equally stranger-controlled, and with no
+	// equivalent of the propagation path's escape: there is no alternative
+	// recipient to select, so refusing costs the message.
+	//
+	// 20 is where the measured curve still sits comfortably: the 3000-round
+	// workblock is built ONCE at ~30ms (each subsequent attempt resumes a
+	// SHA-256 midstate over 32 bytes, it does not re-walk 768 KiB), and a
+	// full grind at this cap averages ~210ms, worst observed ~410ms. That
+	// is ~250x above the 0-8 costs real deployments announce while staying
+	// far short of pinning a core. Past the cap Send fails with
+	// ErrStampCostTooHigh rather than silently shipping unstamped, since a
+	// recipient enforcing stamps would drop that message anyway (§5.7.4).
+	// Per-Delivery override: Delivery.MaxStampCost.
 	MaxDeliveryStampCost = 20
 )
 

@@ -86,7 +86,13 @@ type Delivery struct {
 	inflight chan struct{}
 
 	// OnError is called when an inbound packet can't be decrypted, parsed,
-	// or verified. Implementations typically log.
+	// or verified, and when an outbound send hits a peer-caused problem it
+	// can work around — today, a recipient whose announce app_data carries
+	// an unreadable stamp_cost (§4.3). Implementations typically log.
+	//
+	// It is therefore NOT confined to the Transport dispatcher goroutine:
+	// the outbound calls run on whatever goroutine invoked Send, so a
+	// handler that touches shared state needs its own synchronization.
 	OnError func(error)
 
 	// LinkSendTimeout caps the total elapsed time SendLink (or Send when
@@ -220,9 +226,7 @@ func (d *Delivery) stampOptionsFor(appData []byte) StampOptions {
 	}
 	cost, err := rns.DecodeLXMFAppDataStampCost(appData)
 	if err != nil {
-		if d.OnError != nil {
-			d.OnError(fmt.Errorf("stamp_cost from announce app_data: %w", err))
-		}
+		d.errorf("stamp_cost from announce app_data: %w", err)
 		return StampOptions{}
 	}
 	return StampOptions{Cost: cost, MaxCost: d.MaxStampCost}

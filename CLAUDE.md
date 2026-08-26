@@ -55,7 +55,9 @@ go vet ./...
 go test ./... -count=1
 ```
 
-Go 1.26.1+ (`go-version-file: go.mod` in CI). Deps: `golang.org/x/crypto`, `github.com/vmihailenco/msgpack/v5`. No test workflow runs on push today; CI is the two nightly jobs (`fuzz.yml`, `spec-watch.yml`). Fuzz locally with:
+Go 1.26.1+ (`go-version-file: go.mod` in CI). Deps: `golang.org/x/crypto`, `github.com/vmihailenco/msgpack/v5`.
+
+CI is three workflows: `test.yml` gates every push to `main` and every PR on build + vet + test + `-race`; `fuzz.yml` and `spec-watch.yml` run nightly. `test.yml` is deliberately not gated on `gofmt -l` — the tree is not gofmt-clean under the pinned toolchain, and the offenders predate this work, so **run `gofmt -l` on the files you touch rather than trusting CI to catch formatting.** Fuzz search is nightly, but seed corpora (including regression seeds from past crashers) run as ordinary tests. Fuzz locally with:
 
 ```
 go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
