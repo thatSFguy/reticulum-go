@@ -106,8 +106,18 @@ type Message struct {
 	Content   []byte
 	Fields    map[any]any // usually empty {}
 
-	// Stamp (optional 5th msgpack element; SPEC §5.7).
+	// Stamp (optional 5th msgpack element; SPEC §5.7). Nil when the
+	// payload had no element [4] AND when it had one this decoder could
+	// not read as bytes — use stampElement, not this, to decide whether
+	// the payload is the 5-element form.
 	Stamp []byte
+
+	// stampElement records that the payload array carried a 5th element,
+	// whatever it decoded to. Both the §5.5 message_id rule and the §5.6
+	// variant-2 retry key off the ELEMENT's presence: a peer that emits a
+	// null or non-bytes stamp still wrote a 5-element array, and hashing
+	// or verifying it as a 4-element one diverges from every other client.
+	stampElement bool
 
 	// rawPayload preserves the exact msgpack bytes as received, for use in
 	// Verify per the SPEC §5.6 dual-variant tolerance rule.
@@ -184,18 +194,35 @@ func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte
 // msgID is the recipient-view LXMF message_id (independent of signature
 // — it's just H(dest||source||payload)).
 func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time, opts StampOptions) (wire, msgID []byte, err error) {
-	payload, sig, id, err := packSignedAndStamped(senderID, senderDestHash, destHash, title, content, fields, ts, opts)
+	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
 	if err != nil {
 		return nil, nil, err
 	}
-	// The stamp counts against the single-packet budget: upstream picks
-	// PACKET vs RESOURCE representation from the STAMPED size, so a
+
+	// The stamp counts against the single-packet budget — upstream picks
+	// PACKET vs RESOURCE representation from the STAMPED size — so a
 	// message that only fits unstamped must still route to a link.
-	if len(payload) > MaxOpportunisticPayload {
+	//
+	// Project that size BEFORE grinding. The stamp costs a fixed
+	// stampPayloadOverhead bytes, so an oversize message is knowable from
+	// the unstamped payload, and grinding first would burn a full
+	// proof-of-work only to throw the result away: Delivery.SendWithID
+	// answers ErrPayloadTooLarge by re-packing through sendOverLink, which
+	// grinds again over its own message_id. That made every oversize
+	// message to a stamp-demanding recipient pay twice.
+	projected := len(payload)
+	if opts.Cost > 0 {
+		projected += stampPayloadOverhead
+	}
+	if projected > MaxOpportunisticPayload {
 		return nil, nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
-			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
+			ErrPayloadTooLarge, projected, MaxOpportunisticPayload)
 	}
 
+	payload, err = applyStamp(payload, id, opts)
+	if err != nil {
+		return nil, nil, err
+	}
 	out := make([]byte, 0, len(senderDestHash)+len(sig)+len(payload))
 	out = append(out, senderDestHash...)
 	out = append(out, sig...)
@@ -239,18 +266,29 @@ func packSignedAndStamped(senderID *rns.Identity, senderDestHash, destHash []byt
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	payload, err = applyStamp(payload, msgID, opts)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return payload, sig, msgID, nil
+}
+
+// applyStamp grinds the §5.7.2 proof-of-work over msgID and splices it
+// into payload as element [4]. A zero or negative opts.Cost returns the
+// payload untouched.
+//
+// Kept separate from packSignedAndStamped so a caller that can reject a
+// message on SIZE does so before paying for the proof-of-work — see
+// signAndPackOpportunisticAt.
+func applyStamp(payload, msgID []byte, opts StampOptions) ([]byte, error) {
 	if opts.Cost <= 0 {
-		return payload, sig, msgID, nil
+		return payload, nil
 	}
 	stamp, err := generateStamp(msgID, opts.Cost, workblockExpandRounds, opts.maxCost())
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, err
 	}
-	stamped, err := appendStamp(payload, stamp)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return stamped, sig, msgID, nil
+	return appendStamp(payload, stamp)
 }
 
 // appendStamp turns a signed 4-element payload into the 5-element
@@ -263,6 +301,11 @@ func packSignedAndStamped(senderID *rns.Identity, senderDestHash, destHash []byt
 // so a re-marshalled 5-element payload would verify only by luck on any
 // message with more than one field. Bumping the fixarray header 0x94 ->
 // 0x95 and appending the stamp leaves the signed bytes untouched.
+// stampPayloadOverhead is what a stamp adds to a packed payload: the
+// fixarray header stays one byte wide (0x94 -> 0x95), plus a 2-byte bin8
+// envelope and StampSize bytes of stamp.
+const stampPayloadOverhead = 2 + StampSize
+
 func appendStamp(payload, stamp []byte) ([]byte, error) {
 	if len(stamp) != StampSize {
 		return nil, fmt.Errorf("stamp must be %d bytes, got %d", StampSize, len(stamp))
@@ -377,8 +420,10 @@ func (m *Message) Verify(senderEd25519Pub []byte) error {
 	}
 
 	// Variant 2: strip optional 5th element (stamp) and re-encode the
-	// first 4. Only attempt if a stamp was actually present.
-	if m.Stamp == nil {
+	// first 4. Attempt whenever the ELEMENT was present — a stamp we
+	// could not decode as bytes still has to be stripped, or a peer's
+	// malformed stamp turns into a dropped message.
+	if !m.stampElement {
 		return errors.New("LXMF signature invalid")
 	}
 	stripped, err := reencodeFirstFour(m.rawPayload)
@@ -471,7 +516,11 @@ func ComputeMessageID(destHash, sourceHash, msgpackPayload []byte) []byte {
 // to it would miss.
 func (m *Message) MessageID() []byte {
 	payload := m.rawPayload
-	if m.Stamp != nil {
+	if m.stampElement {
+		// The error is unreachable in practice — unpackPayload already
+		// decoded this array — and MessageID has no way to report one.
+		// Falling back to the raw payload keeps the id defined; it would
+		// diverge from peers, which is why the splice is tried first.
 		if stripped, err := reencodeFirstFour(payload); err == nil {
 			payload = stripped
 		}
@@ -578,6 +627,7 @@ func (m *Message) unpackPayload() error {
 	}
 	m.Fields = fields
 	if len(elems) >= 5 {
+		m.stampElement = true
 		_ = safeUnmarshal(elems[4], &m.Stamp) // best-effort; stamp is optional
 	}
 	return nil

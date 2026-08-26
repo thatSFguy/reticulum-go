@@ -15,6 +15,7 @@ accept.
 """
 import hashlib, json, sys
 import RNS
+import LXMF
 from LXMF import LXStamper
 
 MATERIAL = hashlib.sha256(b"reticulum-go stamp interop vector").digest()
@@ -32,8 +33,13 @@ while True:
         break
     counter += 1
 
+SOURCE = f"upstream RNS {RNS.__version__} / LXMF {LXMF.__version__}, lxmf/testdata/gen_stamp_upstream.py"
+
 out = {
-    "_source": f"upstream RNS {RNS.__version__} / LXMF {__import__("LXMF").__version__}, lxmf/testdata/gen_stamp_upstream.py",
+    # Bound outside the f-string: nesting the same quote style inside an
+    # f-string expression only parses on Python 3.12+ (PEP 701), and this
+    # script is meant to run in whatever venv you happen to build.
+    "_source": SOURCE,
     "material_hex": MATERIAL.hex(),
     "workblock_rounds": LXStamper.WORKBLOCK_EXPAND_ROUNDS,
     "workblock_len": len(wb),
