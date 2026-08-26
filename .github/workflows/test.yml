@@ -1,0 +1,69 @@
+name: test
+
+# The build/vet/test gate. Unlike fuzz.yml and spec-watch.yml — which are
+# scheduled because their value is cumulative machine-time, not per-commit
+# feedback — this runs on every change, because nothing else does: before
+# it existed the only verification a push got was whoever pushed it
+# remembering to run `go test` locally.
+#
+# Fuzz SEED corpora (including regression seeds written by a crasher the
+# nightly fuzz job found) run as ordinary tests here. The fuzz search
+# itself stays nightly.
+on:
+  push:
+    # PR branches are covered by the pull_request trigger below; limiting
+    # push to main keeps a PR from burning two identical runs per commit.
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A force-push or a quick follow-up commit makes the in-flight run
+  # obsolete. Cancel it rather than paying for an answer about code that
+  # no longer exists — except on main, where every commit's result is
+  # worth having.
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          # Single source of truth for the toolchain: the same go.mod
+          # directive fuzz.yml resolves.
+          go-version-file: go.mod
+
+      # Explicit, even though `go test` builds too: this catches a break
+      # in a package that has no test files of its own.
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Plain run first — it is a few seconds and reports ordinary
+      # failures long before the race build finishes compiling.
+      - name: Test
+        run: go test ./... -count=1
+
+      # This stack is concurrency-heavy by nature: a Transport dispatcher
+      # goroutine, a bounded inbound-handler pool, links and resources
+      # driven from timers. A data race here is a wire-format bug that
+      # only shows up under load on someone else's node, so the detector
+      # is a gate rather than a nightly. It costs ~50s on a 2-core runner.
+      - name: Test (race detector)
+        run: go test ./... -count=1 -race
+
+# Deliberately NOT gated on `gofmt -l`: this tree is not gofmt-clean under
+# the toolchain go.mod pins, and the offenders are pre-existing files
+# untouched by recent work. A gate that fails on arrival trains people to
+# ignore CI. Reformat the tree first, then add the check.
