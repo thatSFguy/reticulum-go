@@ -146,11 +146,26 @@ func decodeOptionalInt(raw msgpack.RawMessage, out *int64) error {
 // it). msgID is the recipient-view LXMF message_id, same as the other
 // pack variants.
 func SignAndPackPropagated(senderID *rns.Identity, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash []byte, title, content []byte, fields map[any]any) (lxmfData, transientID, msgID []byte, err error) {
-	return signAndPackPropagatedAt(senderID, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash, title, content, fields, time.Now())
+	return signAndPackPropagatedAt(senderID, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash, title, content, fields, time.Now(), StampOptions{})
 }
 
-func signAndPackPropagatedAt(senderID *rns.Identity, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash []byte, title, content []byte, fields map[any]any, ts time.Time) (lxmfData, transientID, msgID []byte, err error) {
-	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
+// SignAndPackPropagatedStamped is SignAndPackPropagated with a §5.7
+// delivery stamp for the RECIPIENT attached when opts.Cost > 0.
+//
+// A propagated message carries up to two independent stamps, and they are
+// not interchangeable: this one is ground over the message_id, lives
+// inside the encrypted payload as element [4], and is validated by the
+// recipient when they retrieve the message. The propagation stamp is
+// ground over the transient_id, appended in the clear after this function
+// returns, and is validated by the NODE before it agrees to store
+// anything. A node stamp does nothing for a recipient who enforces
+// stamps, which is why store-and-forward delivery needs both.
+func SignAndPackPropagatedStamped(senderID *rns.Identity, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash []byte, title, content []byte, fields map[any]any, opts StampOptions) (lxmfData, transientID, msgID []byte, err error) {
+	return signAndPackPropagatedAt(senderID, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash, title, content, fields, time.Now(), opts)
+}
+
+func signAndPackPropagatedAt(senderID *rns.Identity, senderDestHash, destHash, recipientX25519Pub, recipientIdentityHash []byte, title, content []byte, fields map[any]any, ts time.Time, opts StampOptions) (lxmfData, transientID, msgID []byte, err error) {
+	payload, sig, id, err := packSignedAndStamped(senderID, senderDestHash, destHash, title, content, fields, ts, opts)
 	if err != nil {
 		return nil, nil, nil, err
 	}

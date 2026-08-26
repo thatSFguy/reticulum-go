@@ -352,9 +352,16 @@ func TestParseRejectsNestedFieldBomb(t *testing.T) {
 
 // TestDedupKeyIsStampInvariant is the regression for the replay bypass:
 // SPEC §5.6 lets a stamp be added/changed without invalidating the
-// signature, so message_id (computed over the stamp-inclusive payload)
-// differs for every stamp value. Keying dedup on it let one captured
-// signed body be replayed unboundedly, each copy looking new.
+// signature, so any dedup key derived from the stamp-inclusive payload
+// differs for every stamp value, and one captured signed body can be
+// replayed unboundedly with each copy looking new.
+//
+// Both halves of the defense are asserted here. DedupKey is keyed on the
+// signature, so it cannot vary with the stamp by construction. message_id
+// is stamp-invariant too, but only because MessageID strips element [4]
+// before hashing per SPEC §5.5 — hash the 5-element payload as-received
+// (this implementation's behavior before outbound stamps landed) and it
+// varies per stamp again.
 func TestDedupKeyIsStampInvariant(t *testing.T) {
 	sender, _ := rns.NewIdentity()
 	senderDest := sender.DestinationHashFor(FullName())
@@ -415,8 +422,13 @@ func TestDedupKeyIsStampInvariant(t *testing.T) {
 		seenKeys[hex.EncodeToString(m.DedupKey())] = true
 	}
 
-	if len(seenIDs) == 1 {
-		t.Error("premise broken — message_id should differ per stamp")
+	// SPEC §5.5: for a stamped message the id is hashed over the first
+	// four elements, so it must not move when only the stamp does.
+	if len(seenIDs) != 1 {
+		t.Errorf("message_id produced %d distinct values across stamp variants; want 1 (SPEC §5.5)", len(seenIDs))
+	}
+	if hex.EncodeToString(base.MessageID()) != firstKey(seenIDs) {
+		t.Error("message_id of stamped variants differs from the unstamped original")
 	}
 	if len(seenKeys) != 1 {
 		t.Errorf("DedupKey produced %d distinct values across stamp variants; want 1", len(seenKeys))

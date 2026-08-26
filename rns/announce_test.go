@@ -280,3 +280,112 @@ func TestPlausibleEmittedAtRejectsOutOfRange(t *testing.T) {
 		t.Errorf("accepted timestamp is not marshalable: %v", err)
 	}
 }
+
+// TestDecodeLXMFAppDataStampCost covers the announce field that decides
+// whether a sender must do proof-of-work for us (SPEC §4.3 element [1],
+// applied per §5.7.4).
+func TestDecodeLXMFAppDataStampCost(t *testing.T) {
+	withCost := func(c int) []byte {
+		data, err := EncodeLXMFAppData([]byte("Reticulum5"), &c)
+		if err != nil {
+			t.Fatalf("EncodeLXMFAppData: %v", err)
+		}
+		return data
+	}
+	noCost, err := EncodeLXMFAppData([]byte("Reticulum5"), nil)
+	if err != nil {
+		t.Fatalf("EncodeLXMFAppData: %v", err)
+	}
+
+	for _, c := range []struct {
+		name string
+		in   []byte
+		want int
+	}{
+		{"round-trips our own encoder", withCost(8), 8},
+		{"explicit zero", withCost(0), 0},
+		{"msgpack nil means no demand", noCost, 0},
+		{"empty app_data", nil, 0},
+		// Legacy "original announce format": app_data is the raw UTF-8
+		// display name with no array around it, so there is no element
+		// [1] to read (§4.3).
+		{"legacy raw-UTF8 name", []byte("Reticulum5"), 0},
+		// 1-element array — a name-only announce.
+		{"name-only array", []byte{0x91, 0xc4, 0x01, 'n'}, 0},
+		// 3-element array: [name, stamp_cost, capability_flags]. The
+		// cost is still element [1].
+		{"3-element array", []byte{0x93, 0xc4, 0x01, 'n', 0x0c, 0x00}, 12},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := DecodeLXMFAppDataStampCost(c.in)
+			if err != nil {
+				t.Fatalf("DecodeLXMFAppDataStampCost: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("stamp_cost = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestDecodeLXMFAppDataStampCostRejectsGarbage: a stamp_cost we cannot
+// read is an error rather than a silent 0. Treating it as "no stamp"
+// would send an unstamped message to a peer that may enforce stamps, and
+// the drop happens on their side where we never see it (§5.7.4).
+func TestDecodeLXMFAppDataStampCostRejectsGarbage(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		in   []byte
+	}{
+		// [bin "n", str "high"] — element [1] is text, not an integer.
+		{"stamp_cost is a string", []byte{0x92, 0xc4, 0x01, 'n', 0xa4, 'h', 'i', 'g', 'h'}},
+		// [bin "n", -1] — negative fixint.
+		{"negative stamp_cost", []byte{0x92, 0xc4, 0x01, 'n', 0xff}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := DecodeLXMFAppDataStampCost(c.in)
+			if err == nil {
+				t.Errorf("accepted malformed stamp_cost, returned %d", got)
+			}
+			if got != 0 {
+				t.Errorf("cost = %d on error, want 0", got)
+			}
+		})
+	}
+}
+
+// FuzzDecodeLXMFAppDataStampCost fuzzes the announce field that decides
+// how much proof-of-work we do for a peer. app_data is fully
+// attacker-controlled and this decoder runs on every announce we recall
+// before a send, so it must never panic and never return a cost that
+// isn't a plausible bit count.
+func FuzzDecodeLXMFAppDataStampCost(f *testing.F) {
+	cost := 8
+	withCost, _ := EncodeLXMFAppData([]byte("peer"), &cost)
+	noCost, _ := EncodeLXMFAppData([]byte("peer"), nil)
+	f.Add(withCost)
+	f.Add(noCost)
+	f.Add([]byte("Reticulum5"))                                 // legacy raw-UTF8
+	f.Add([]byte{0x92, 0xc4, 0x01, 'n', 0xcf, 0xff, 0xff, 0xff, // uint64 max cost
+		0xff, 0xff, 0xff, 0xff, 0xff})
+	f.Add([]byte{0x93, 0xc4, 0x01, 'n', 0x0c, 0x00}) // 3-element form
+	f.Add([]byte{0x92, 0xc4, 0x01, 'n', 0xff})       // negative fixint
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got, err := DecodeLXMFAppDataStampCost(data)
+		if err != nil {
+			if got != 0 {
+				t.Errorf("cost = %d alongside error %v; callers read the value on error paths too", got, err)
+			}
+			return
+		}
+		// An accepted cost is a leading-zero-bit target for SHA-256, so
+		// it cannot be negative and cannot exceed the digest width. A
+		// value outside that range means a decode path produced a number
+		// the grind loop would treat as work it can never finish.
+		if got < 0 || got > 256 {
+			t.Errorf("accepted implausible stamp_cost %d", got)
+		}
+	})
+}

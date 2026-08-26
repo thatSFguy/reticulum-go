@@ -33,6 +33,11 @@ jobs:
         include:
           - pkg: ./rns/
             target: FuzzValidateMsgpackBounds
+          # DecodeLXMFAppDataStampCost turns a stranger's announce into a
+          # proof-of-work target the sender then burns CPU on, so bad
+          # input there costs real work rather than just a failed decode.
+          - pkg: ./rns/
+            target: FuzzDecodeLXMFAppDataStampCost
     steps:
       - uses: actions/checkout@v5
 
