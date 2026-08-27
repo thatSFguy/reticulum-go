@@ -302,3 +302,46 @@ func TestUnregisterRequestHandler(t *testing.T) {
 		t.Error("an unregistered handler still answered")
 	}
 }
+
+// A Resource carrying a §11 RESPONSE must be labelled in the
+// advertisement with the request_id (`q`) and the is_response flag
+// (`p`), §10.4. Without the labels the assembled body is
+// indistinguishable from application payload: it would be handed to the
+// link's data callback while the initiator's receipt waited out its
+// timeout, which is exactly how a large page fetch fails silently.
+func TestRPCResourceAdvertisementIsLabelled(t *testing.T) {
+	link, tp, _ := makeActiveTestLink(t)
+	requestID := bytes.Repeat([]byte{0x5A}, RequestIDLen)
+	body := bytes.Repeat([]byte{0x01}, LinkMDU*3)
+
+	rs, err := NewRPCResourceSender(tp, link, body, nil, noopLogger{}, requestID, ResourceFlagIsResponse)
+	if err != nil {
+		t.Fatalf("NewRPCResourceSender: %v", err)
+	}
+	adv, err := rs.ParseAdvertisement()
+	if err != nil {
+		t.Fatalf("ParseAdvertisement: %v", err)
+	}
+	if !bytes.Equal(adv.RequestID, requestID) {
+		t.Errorf("adv q = %x, want %x", adv.RequestID, requestID)
+	}
+	if byte(adv.Flags)&ResourceFlagIsResponse == 0 {
+		t.Errorf("adv flags = %#x, missing the p is_response bit", adv.Flags)
+	}
+	if byte(adv.Flags)&ResourceFlagIsRequest != 0 {
+		t.Error("adv carries the u is_request bit on a response")
+	}
+	// The plain constructor must stay unlabelled, or every ordinary
+	// Resource would be mistaken for an RPC answer.
+	plain, err := NewResourceSender(tp, link, body, nil, noopLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainAdv, err := plain.ParseAdvertisement()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plainAdv.RequestID) != 0 || byte(plainAdv.Flags)&(ResourceFlagIsResponse|ResourceFlagIsRequest) != 0 {
+		t.Errorf("plain Resource is labelled as RPC: q=%x flags=%#x", plainAdv.RequestID, plainAdv.Flags)
+	}
+}

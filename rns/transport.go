@@ -1766,3 +1766,33 @@ func (t *Transport) oldestEvictableLocked() string {
 	}
 	return oldestAny
 }
+
+// AcquireLink returns an ACTIVE link to `responderDestHash`, reusing an
+// existing one or running the §6 handshake if none is live. Callers that
+// need several round trips against the same peer — the §11 RPC paths,
+// LXMF propagation retrieval — hold the link across them rather than
+// paying a handshake per request.
+func (t *Transport) AcquireLink(responderDestHash []byte, timeout time.Duration) (*Link, error) {
+	if len(responderDestHash) != IdentityHashLen {
+		return nil, fmt.Errorf("responder dest_hash must be %d bytes, got %d", IdentityHashLen, len(responderDestHash))
+	}
+	if timeout <= 0 {
+		timeout = DefaultLinkSendTimeout
+	}
+	return t.acquireLinkTo(responderDestHash, time.Now().Add(timeout))
+}
+
+// IdentifyOnLink sends the §6.7.6 LINKIDENTIFY that tells the responder
+// which long-term identity is driving this link. Required before any
+// request the peer gates on identity — an LXMF propagation node answers
+// ERROR_NO_IDENTITY (0xf0) to an unidentified /get.
+func (t *Transport) IdentifyOnLink(linkID []byte, id *Identity) error {
+	if id == nil {
+		return errors.New("nil identity")
+	}
+	l := t.linkManager.Get(linkID)
+	if l == nil {
+		return fmt.Errorf("IdentifyOnLink: unknown link_id %x", linkID)
+	}
+	return t.sendLinkIdentify(linkID, l, id)
+}

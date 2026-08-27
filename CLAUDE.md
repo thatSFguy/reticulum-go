@@ -76,6 +76,7 @@ go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
 | Transport, path finding, relayed-packet handling (§7, §12) | `rns/transport.go`, `rns/path.go` |
 | Resource fragmentation (§10) | `rns/resource*.go` |
 | REQUEST/RESPONSE RPC (§11) | `rns/request.go`, `rns/request_dispatch.go` |
+| Propagation retrieval — client `/get` (§5.8.3) | `lxmf/retrieve.go` |
 | HDLC framing + TCP interface (§8) | `rns/hdlc.go`, `rns/tcp.go`, `rns/tcp_reconnect.go` |
 | Hostile-msgpack guard | `rns/msgpack_guard.go` (+ fuzz target) |
 | LXMF message pack/unpack, signature (§5.3–§5.6) | `lxmf/message.go` |
@@ -91,7 +92,7 @@ Read this before "fixing" a perceived gap; these are decisions, not oversights.
 
 - **Stamps are outbound-only.** `lxmf/stamp.go` generates both §5.7.2 flavors: delivery stamps at `WORKBLOCK_EXPAND_ROUNDS = 3000` over the `message_id`, spliced in as payload element [4] for recipients whose announce declares a `stamp_cost`; and propagation stamps at `WORKBLOCK_EXPAND_ROUNDS_PN = 1000` over the `transient_id`, appended raw for nodes that declare one. `Delivery` applies both automatically from the peer's announce, with `DisableOutboundStamps` / `MaxStampCost` as the escape hatches. **Not implemented:** inbound stamp validation and `stamp_value` scoring (§5.7.2 step 3), and enforcement/drop of unstamped inbound. Inbound stamps are parsed and stripped correctly for signature verification (`message.go`, §5.7.1) and exposed as `Message.Stamp`, but never checked — the documented interop minimum of §5.7.4 ("implement PoW for outbound; tolerate-but-don't-validate inbound").
 - **Tickets (§5.7.3) are not implemented at all** — no `FIELD_TICKET` (`0x0C`) issuance, no ticket cache, no `SHA256(ticket || message_id)` shortcut. Spec calls this Tier-3.
-- **Propagation-node *server* role (§5.8) is out of scope** — this is a client that submits to and retrieves from nodes, not a node. No peering keys (`WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`).
+- **Propagation-node *server* role (§5.8) is out of scope** — this is a client that submits to and retrieves from nodes, not a node. No peering keys (`WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`). The client half of both directions IS implemented: `SendPropagated` submits, `RetrievePropagated` collects (§5.8.3).
 - **IFAC-sealed packets are rejected**, not decoded (`rns/packet.go`).
 - **The transport-node (relay) role is out of scope.** This is a leaf that talks *through* relays — it originates the §2.3 HEADER_2 conversion and consumes relayed packets, but never forwards anyone else's traffic. So the §12 relay rules, §7.2.2 path-request dedup, and the §12.3.2 / §16.1 transport-node tables (`reverse_table`, `link_table`, random blobs) have no implementation here, and upstream changes to them are no-ops for us.
 

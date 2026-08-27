@@ -1,6 +1,7 @@
 package rns
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -175,11 +176,19 @@ func (t *Transport) handleRequest(p *Packet) {
 		return
 	}
 	if len(packed) > LinkMDU {
-		// Resource-form RESPONSEs (§11.2) need the advertisement's `q`
-		// and `p` flags, which the Resource sender does not set yet.
-		// Reception of one is implemented; emission is not.
-		t.logger.Printf("response for %q is %d bytes, over the %d-byte single-packet budget (Resource-form RESPONSE emission not implemented)",
-			entry.path, len(packed), LinkMDU)
+		// §11.2: a response past the link MDU rides a Resource, labelled
+		// with this request_id and the `p` is_response flag so the
+		// initiator's receipt claims it. This is the ordinary case, not
+		// the exception — at a 431-byte MDU most real answers exceed it.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(len(packed)))
+			defer cancel()
+			var transportID []byte
+			if err := t.sendRPCResourceOverLink(ctx, l, packed, transportID, requestID, ResourceFlagIsResponse); err != nil {
+				t.logger.Printf("resource response for %q: %v", entry.path, err)
+			}
+		}()
+		t.logger.Printf("request %q answered on link %x by Resource (id %x, %d bytes)", entry.path, p.DestHash[:4], requestID[:4], len(packed))
 		return
 	}
 

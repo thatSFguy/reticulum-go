@@ -85,6 +85,22 @@ type ResourceSender struct {
 // `transportID` so each part is routed via HEADER_2; pass nil
 // otherwise.
 func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte, logger Logger) (*ResourceSender, error) {
+	return NewRPCResourceSender(t, link, body, transportID, logger, nil, 0)
+}
+
+// NewRPCResourceSender is NewResourceSender for a Resource that carries
+// a §11 REQUEST or RESPONSE body rather than application payload.
+//
+// requestID goes in the advertisement's `q` slot and rpcFlags carries
+// ResourceFlagIsRequest (`u`) or ResourceFlagIsResponse (`p`) per §10.4.
+// That labelling is the only thing that lets the receiving side hand the
+// assembled body to the request machinery instead of to the link's data
+// callback — an unlabelled Resource is indistinguishable from ordinary
+// payload, and the initiator's receipt would wait out its timeout while
+// the answer sat in the application's inbox.
+//
+// requestID nil / rpcFlags 0 gives the plain form.
+func NewRPCResourceSender(t *Transport, link *Link, body []byte, transportID []byte, logger Logger, requestID []byte, rpcFlags byte) (*ResourceSender, error) {
 	if t == nil || link == nil {
 		return nil, errors.New("resource sender: nil transport or link")
 	}
@@ -182,7 +198,8 @@ func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 		OriginalHash:  hash,
 		SegmentIndex:  1,
 		TotalSegments: 1,
-		Flags:         int(ResourceFlagEncrypted),
+		Flags:         int(ResourceFlagEncrypted | rpcFlags),
+		RequestID:     requestID,
 		Hashmap:       hashmap,
 	})
 	if err != nil {
