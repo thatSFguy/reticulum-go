@@ -73,7 +73,7 @@ go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
 | Announce wire format + LXMF app_data (§4) | `rns/announce.go` |
 | Link handshake / state machine / data (§6) | `rns/link.go`, `rns/link_state.go`, `rns/link_data.go` |
 | Proofs (§6.6) | `rns/proof.go` |
-| Transport, path finding, relay (§7, §12) | `rns/transport.go`, `rns/path.go` |
+| Transport, path finding, relayed-packet handling (§7, §12) | `rns/transport.go`, `rns/path.go` |
 | Resource fragmentation (§10) | `rns/resource*.go` |
 | HDLC framing + TCP interface (§8) | `rns/hdlc.go`, `rns/tcp.go`, `rns/tcp_reconnect.go` |
 | Hostile-msgpack guard | `rns/msgpack_guard.go` (+ fuzz target) |
@@ -92,6 +92,7 @@ Read this before "fixing" a perceived gap; these are decisions, not oversights.
 - **Tickets (§5.7.3) are not implemented at all** — no `FIELD_TICKET` (`0x0C`) issuance, no ticket cache, no `SHA256(ticket || message_id)` shortcut. Spec calls this Tier-3.
 - **Propagation-node *server* role (§5.8) is out of scope** — this is a client that submits to and retrieves from nodes, not a node. No peering keys (`WORKBLOCK_EXPAND_ROUNDS_PEERING = 25`).
 - **IFAC-sealed packets are rejected**, not decoded (`rns/packet.go`).
+- **The transport-node (relay) role is out of scope.** This is a leaf that talks *through* relays — it originates the §2.3 HEADER_2 conversion and consumes relayed packets, but never forwards anyone else's traffic. So the §12 relay rules, §7.2.2 path-request dedup, and the §12.3.2 / §16.1 transport-node tables (`reverse_table`, `link_table`, random blobs) have no implementation here, and upstream changes to them are no-ops for us.
 
 `MaxPropagationStampCost` / `MaxDeliveryStampCost` (both 20) in `lxmf/stamp.go` cap grind work because `stamp_cost` comes from a stranger's announce; see the comments there before changing either.
 

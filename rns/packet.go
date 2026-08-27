@@ -99,6 +99,16 @@ func (p *Packet) Pack() ([]byte, error) {
 	if len(p.DestHash) != addressHashLen {
 		return nil, fmt.Errorf("dest hash must be %d bytes, got %d", addressHashLen, len(p.DestHash))
 	}
+	// SPEC §2.4: since RNS 1.5.0 the hop bound is enforced on emit as
+	// well as receive — Packet.send() returns False without packing at
+	// hops >= PATHFINDER_M (Packet.py:288) and Transport._outbound
+	// rejects the same before interface selection (Transport.py:1305).
+	// A leaf emits hops=0, so this only bites a caller that sets the
+	// field itself; that is exactly when a silent 128-hop emission would
+	// be hardest to trace back.
+	if p.Hops >= maxWireHops {
+		return nil, fmt.Errorf("hops %d >= %d, refusing to emit (SPEC §2.4)", p.Hops, maxWireHops)
+	}
 
 	flags := packFlags(p.HeaderType, p.ContextFlag, p.TransportType, p.DestinationType, p.PacketType)
 
