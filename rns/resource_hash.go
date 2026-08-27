@@ -66,22 +66,38 @@ func ResourceMapHash(partCiphertext, randomHashR []byte) []byte {
 	return sum[:ResourceMapHashLen]
 }
 
-// SplitParts slices `wireBlob` (the link-encrypted body) into
-// per-part ciphertext chunks of ResourceSDU bytes. The last chunk is
-// short. Returns nil on empty input — a zero-length resource is
-// invalid (the caller should fall back to an empty Link DATA packet).
+// SplitParts slices `wireBlob` (the link-encrypted body) into per-part
+// ciphertext chunks at the BASE ResourceSDU.
+//
+// Prefer SplitPartsWithSDU with the link's own SDU for anything sent on
+// a real link: §10.2 step 6 sizes parts from the negotiated MTU, and a
+// receiver computes how many parts to expect from ITS sdu
+// (`total_parts = ceil(size/sdu)`, RNS/Resource.py:187) rather than from
+// the advertised n. Split at 464 on a link that negotiated 1064 and the
+// peer expects roughly half as many parts as arrive.
+func SplitParts(wireBlob []byte) [][]byte {
+	return SplitPartsWithSDU(wireBlob, ResourceSDU)
+}
+
+// SplitPartsWithSDU slices `wireBlob` into per-part ciphertext chunks of
+// `sdu` bytes. The last chunk is short. Returns nil on empty input — a
+// zero-length resource is invalid (the caller should fall back to an
+// empty Link DATA packet). A non-positive sdu falls back to ResourceSDU.
 //
 // Critically, parts are SLICES of the encrypted blob, not separately
 // encrypted units (SPEC §10.12). A receiver that calls link.decrypt
 // on each part fails — the per-part bytes are missing the Token
 // header. Decrypt happens once over the concatenation in assemble().
-func SplitParts(wireBlob []byte) [][]byte {
+func SplitPartsWithSDU(wireBlob []byte, sdu int) [][]byte {
 	if len(wireBlob) == 0 {
 		return nil
 	}
-	parts := make([][]byte, 0, (len(wireBlob)+ResourceSDU-1)/ResourceSDU)
-	for off := 0; off < len(wireBlob); off += ResourceSDU {
-		end := off + ResourceSDU
+	if sdu <= 0 {
+		sdu = ResourceSDU
+	}
+	parts := make([][]byte, 0, (len(wireBlob)+sdu-1)/sdu)
+	for off := 0; off < len(wireBlob); off += sdu {
+		end := off + sdu
 		if end > len(wireBlob) {
 			end = len(wireBlob)
 		}

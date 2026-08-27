@@ -478,11 +478,15 @@ func (rr *ResourceReceiver) placePart(part []byte) error {
 			dup = true
 			continue
 		}
-		// Never accumulate past what the advertisement promised.
-		// assemble() already rejects a transfer whose total does not
-		// match, but only after every part is buffered — a sender that
-		// keeps feeding parts that each fit the hashmap window would
-		// otherwise be paid for in memory first and rejected second.
+		// Never accumulate past what the advertisement promised. OUR
+		// assemble() rejects a transfer whose total does not match, but
+		// only after every part is buffered — a sender that keeps feeding
+		// parts that each fit the hashmap window would otherwise be paid
+		// for in memory first and rejected second. Upstream's assemble()
+		// does not compare the total at all (SPEC §10.4), so neither this
+		// bound nor that check has anything to conform to: both are the
+		// §16.8 allocation limits a category-3 implementation adds for
+		// itself, and §10.4 now recommends exactly this one.
 		if rr.expectedSize > 0 && rr.receivedBytes+len(part) > rr.expectedSize {
 			return fmt.Errorf("%w: %d + %d > advertised %d bytes",
 				errResourceOverAdvertisedSize, rr.receivedBytes, len(part), rr.expectedSize)
