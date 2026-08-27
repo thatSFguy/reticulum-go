@@ -48,6 +48,10 @@ type Transport struct {
 	requestHandlers map[string]*requestHandlerEntry
 	pendingRequests map[string]*RequestReceipt
 
+	// segments reassembles §10.11 multi-segment resources, whose parts
+	// arrive as independent Resource transfers.
+	segments *segmentAssembler
+
 	// pinned holds destinations protected from cache eviction, keyed by
 	// hex dest_hash. See PinDestinations.
 	pinned map[string]struct{}
@@ -251,6 +255,7 @@ func NewTransport(logger Logger) *Transport {
 		pathRequestsSent:     map[string]time.Time{},
 		pathResponseTagsSeen: map[string]time.Time{},
 		linkManager:          NewLinkManager(),
+		segments:             newSegmentAssembler(),
 		logger:               logger,
 		rlog:                 newRateLimitedLogger(logger),
 	}
