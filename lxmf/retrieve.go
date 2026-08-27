@@ -254,7 +254,7 @@ func (d *Delivery) parseRetrieved(body []byte) (*Message, bool, error) {
 		return nil, false, fmt.Errorf("body is %d bytes, too short to carry dest_hash + ciphertext", len(body))
 	}
 	destHash := body[:rns.IdentityHashLen]
-	plain, err := rns.TokenDecrypt(d.identity, body[rns.IdentityHashLen:])
+	plain, err := d.decryptInbound(body[rns.IdentityHashLen:])
 	if err != nil {
 		return nil, false, fmt.Errorf("decrypt: %w", err)
 	}

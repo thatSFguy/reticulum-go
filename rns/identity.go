@@ -3,9 +3,11 @@
 // implementation; it tracks the spec at github.com/thatSFguy/reticulum-specifications
 // and is verified against the test vectors there plus a live Python rnsd peer.
 //
-// Currently implemented: identity, Token cipher, packet header, announce,
-// HDLC framing for TCPClientInterface. Out of scope (for now): link delivery,
-// propagation node, ratchets, RNode/LoRa, transport-relay forwarding.
+// Implemented: identity, Token cipher (with §7.3 ratchets), packet
+// header, announce, links and link control, resources, the §11
+// REQUEST/RESPONSE RPC, HDLC framing with TCP client and server
+// interfaces. Out of scope: the transport-node/relay role, IFAC, RNode
+// and AutoInterface bearers, Channel/Buffer. See CLAUDE.md §2.3.
 package rns
 
 import (

@@ -99,9 +99,48 @@ func TokenEncrypt(plaintext, recipientX25519Pub, recipientIdentityHash []byte) (
 }
 
 // TokenDecrypt verifies the HMAC and (on success) AES-CBC decrypts the
-// payload. Only the long-term X25519 private key is used here. Ratchet
-// support is deferred (SPEC §7.3 / §7.4).
+// payload using the long-term X25519 private key.
+//
+// A sender who has seen our ratchet announce encrypts to the RATCHET
+// key instead (§3 step 2), and such a token will not open here — use
+// TokenDecryptWithRatchets on any receive path where we publish one.
 func TokenDecrypt(id *Identity, wire []byte) ([]byte, error) {
+	return tokenDecryptWithKey(id, wire, nil)
+}
+
+// TokenDecryptWithRatchets is the §7.4 inbound decrypt: try each
+// ratchet private key in turn, newest first, then fall back to the
+// long-term key.
+//
+// The ring exists because rotation races announce propagation. A sender
+// who has our previous ratchet keeps using it until the new announce
+// reaches them, so messages encrypted to a just-rotated-out key are
+// in flight at every rotation — dropping them would make rotation
+// itself lossy. The long-term fallback covers senders who have never
+// seen a ratchet announce at all, which §3 explicitly permits.
+//
+// Trying keys is cheap relative to being wrong: each attempt is one
+// ECDH plus an HMAC compare, and a mismatch is rejected by the MAC
+// before any decryption happens.
+func TokenDecryptWithRatchets(id *Identity, wire []byte, ratchetPrivs [][]byte) ([]byte, error) {
+	for _, priv := range ratchetPrivs {
+		if len(priv) != ratchetPrivLen {
+			continue
+		}
+		if out, err := tokenDecryptWithKey(id, wire, priv); err == nil {
+			return out, nil
+		}
+	}
+	out, err := tokenDecryptWithKey(id, wire, nil)
+	if err != nil && len(ratchetPrivs) > 0 {
+		return nil, fmt.Errorf("%w (%d ratchets tried): %v", ErrRatchetDecryptFailed, len(ratchetPrivs), err)
+	}
+	return out, err
+}
+
+// tokenDecryptWithKey does the work, using `priv` for the ECDH when
+// non-nil and the identity's long-term key otherwise.
+func tokenDecryptWithKey(id *Identity, wire []byte, priv []byte) ([]byte, error) {
 	if id == nil {
 		return nil, errors.New("nil identity")
 	}
@@ -117,13 +156,21 @@ func TokenDecrypt(id *Identity, wire []byte) ([]byte, error) {
 	mac := wire[len(wire)-tokenHMACLen:]
 	ciphertext := wire[tokenEphPubLen+tokenIVLen : len(wire)-tokenHMACLen]
 
-	// ECDH with our long-term X25519 private key.
-	shared, err := curve25519.X25519(id.x25519Priv[:], ephPub)
+	// ECDH with the ratchet key when one was supplied, else our
+	// long-term X25519 private key.
+	ecdhPriv := id.x25519Priv[:]
+	if len(priv) == ratchetPrivLen {
+		ecdhPriv = priv
+	}
+	shared, err := curve25519.X25519(ecdhPriv, ephPub)
 	if err != nil {
 		return nil, fmt.Errorf("ECDH: %w", err)
 	}
 
-	// HKDF salt is OUR identity hash — we are the recipient.
+	// HKDF salt is OUR identity hash — we are the recipient. It stays
+	// the identity hash even under a ratchet: §3 step 3 is explicit
+	// that the salt is not the ratchet hash, so only the ECDH input
+	// changes between the two cases.
 	signingKey, encryptionKey, err := tokenDeriveKeys(shared, id.Hash())
 	if err != nil {
 		return nil, err

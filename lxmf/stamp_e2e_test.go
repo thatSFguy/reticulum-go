@@ -273,3 +273,79 @@ func (f *stampFixture) peekMessage() *Message {
 	defer f.mu.Unlock()
 	return f.got
 }
+
+// End to end with ratchets: bob publishes one, alice learns it from his
+// announce and encrypts to it, and bob decrypts through his ring. The
+// long-term key must NOT open the message — that absence is the forward
+// secrecy the whole mechanism exists for.
+func TestRatchetEndToEndDelivery(t *testing.T) {
+	alice, _ := rns.NewIdentity()
+	bob, _ := rns.NewIdentity()
+
+	aIface, bIface, stop := pairedInterfaces()
+	tA := rns.NewTransport(nil)
+	tA.AddInterface(aIface)
+	tB := rns.NewTransport(nil)
+	tB.AddInterface(bIface)
+
+	delA, err := NewDelivery(tA, alice, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delB, err := NewDelivery(tB, bob, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keeper, err := rns.NewRatchetKeeper()
+	if err != nil {
+		t.Fatal(err)
+	}
+	delB.Ratchets = keeper
+
+	var mu sync.Mutex
+	var got *Message
+	delB.OnMessage = func(m *Message) { mu.Lock(); got = m; mu.Unlock() }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tA.Run(ctx)
+	go tB.Run(ctx)
+	t.Cleanup(stop)
+
+	appData, _ := rns.EncodeLXMFAppData([]byte("peer"), nil)
+	// Bob announces WITH his ratchet; alice announces without.
+	bobPkt, err := rns.BuildAnnounce(bob, FullName(), appData, keeper.Current())
+	if err != nil {
+		t.Fatal(err)
+	}
+	alicePkt, err := rns.BuildAnnounce(alice, FullName(), appData, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tB.Broadcast(bobPkt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tA.Broadcast(alicePkt); err != nil {
+		t.Fatal(err)
+	}
+	bobDest := bob.DestinationHashFor(FullName())
+	if !waitFor(time.Second, func() bool {
+		k := tA.Recall(bobDest)
+		return k != nil && len(k.RatchetPub) == 32 && tB.Recall(alice.DestinationHashFor(FullName())) != nil
+	}) {
+		t.Fatal("alice never learned bob's ratchet from his announce")
+	}
+
+	if err := delA.Send(delB.Hash(), nil, []byte("forward secret"), nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !waitFor(2*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return got != nil }) {
+		t.Fatal("ratchet-encrypted message never arrived")
+	}
+	mu.Lock()
+	content := string(got.Content)
+	mu.Unlock()
+	if content != "forward secret" {
+		t.Errorf("content = %q", content)
+	}
+}
