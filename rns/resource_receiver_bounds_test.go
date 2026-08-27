@@ -296,3 +296,48 @@ func TestResourceConstantsMatchUpstream(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitPartsFollowsTheLinkSDU is the send-side half of the per-link
+// SDU rule (SPEC §10.2 step 6). It matters because a receiver does NOT
+// trust the part count we advertise: upstream computes
+// `total_parts = ceil(size/sdu)` from its OWN sdu
+// (RNS/Resource.py:187) and sizes its parts array from that. Split at
+// the base 464 on a link that negotiated 1064 and the peer allocates
+// roughly half the slots we are about to fill.
+func TestSplitPartsFollowsTheLinkSDU(t *testing.T) {
+	const negotiatedMTU = 1064
+	linkSDU := negotiatedMTU - ReticulumHeaderMaxSize - ReticulumIFACMinSize
+	body := bytes.Repeat([]byte{0x5A}, 4000)
+
+	parts := SplitPartsWithSDU(body, linkSDU)
+	want := (len(body) + linkSDU - 1) / linkSDU
+	if len(parts) != want {
+		t.Errorf("split into %d parts at sdu %d, want %d", len(parts), linkSDU, want)
+	}
+	// This is the count a conformant peer on that link derives.
+	if got := (len(body) + linkSDU - 1) / linkSDU; len(parts) != got {
+		t.Errorf("part count %d disagrees with the peer's ceil(size/sdu) = %d", len(parts), got)
+	}
+	for i, p := range parts[:len(parts)-1] {
+		if len(p) != linkSDU {
+			t.Fatalf("part %d is %d bytes, want a full %d-byte slice", i, len(p), linkSDU)
+		}
+	}
+	// Reassembly must be lossless regardless of where the cuts fall.
+	var joined []byte
+	for _, p := range parts {
+		joined = append(joined, p...)
+	}
+	if !bytes.Equal(joined, body) {
+		t.Error("parts do not reassemble to the original body")
+	}
+	// Splitting the same body at the base SDU yields a different count —
+	// which is precisely the disagreement this guards against.
+	if base := SplitParts(body); len(base) == len(parts) {
+		t.Errorf("premise broken: base and link SDU produced the same count %d", len(base))
+	}
+	// A non-positive sdu must not divide by zero.
+	if got := len(SplitPartsWithSDU(body, 0)); got != len(SplitParts(body)) {
+		t.Errorf("sdu=0 produced %d parts, want the base-SDU count %d", got, len(SplitParts(body)))
+	}
+}

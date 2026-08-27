@@ -126,7 +126,12 @@ func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 		return nil, fmt.Errorf("resource sender: link-encrypt: %w", err)
 	}
 
-	parts := SplitParts(wireBlob)
+	// Split at the LINK's SDU, not the base one. The receiver derives
+	// how many parts to expect from its own sdu — ceil(size/sdu),
+	// RNS/Resource.py:187 — and ignores the n we advertise, so a split
+	// at 464 on a link that negotiated 1064 leaves it expecting about
+	// half the parts we send (SPEC §10.2 step 6).
+	parts := SplitPartsWithSDU(wireBlob, link.SDU())
 	if len(parts) == 0 {
 		return nil, errors.New("resource sender: zero parts after split (impossible — body validated non-empty)")
 	}
