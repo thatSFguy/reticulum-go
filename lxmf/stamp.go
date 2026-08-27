@@ -119,11 +119,19 @@ func leadingZeroBits(b []byte) int {
 	return n
 }
 
+// stampDigest is SHA256(workblock || stamp), the value both stamp_valid
+// and stamp_value are defined over (§5.7.2).
+func stampDigest(workblock, stamp []byte) []byte {
+	h := sha256.New()
+	h.Write(workblock)
+	h.Write(stamp)
+	return h.Sum(nil)
+}
+
 // stampValid reports whether SHA256(workblock || stamp) clears
 // `cost` leading zero bits (§5.7.2 stamp_valid).
 func stampValid(stamp []byte, cost int, workblock []byte) bool {
-	digest := sha256.Sum256(append(append([]byte{}, workblock...), stamp...))
-	return leadingZeroBits(digest[:]) >= cost
+	return leadingZeroBits(stampDigest(workblock, stamp)) >= cost
 }
 
 // GeneratePropagationStamp grinds a §5.7.2 stamp over the PN workblock

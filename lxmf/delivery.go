@@ -130,6 +130,21 @@ type Delivery struct {
 	// Lower it on constrained hardware; raise it only if you have a
 	// concrete peer demanding more and CPU to burn.
 	MaxStampCost int
+
+	// InboundStampCost is the §5.7.4 cost we require of senders — the
+	// same value we announce in app_data element [1]. Zero means we ask
+	// for nothing and inbound stamps are neither checked nor scored.
+	//
+	// Setting it makes every stamped inbound message cost a 768 KiB
+	// workblock to verify, which is attacker-triggered work; see
+	// MaxConcurrentStampValidations.
+	InboundStampCost int
+
+	// EnforceStamps drops inbound messages that do not clear
+	// InboundStampCost, instead of delivering them with StampValid
+	// false. Off by default, matching upstream's _enforce_stamps —
+	// §5.7.4's third row is the default behaviour, not the second.
+	EnforceStamps bool
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -499,6 +514,12 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 	}
 	if err := msg.Verify(sender.Ed25519Public()); err != nil {
 		d.errorf("verify: %w", err)
+		return
+	}
+	// Stamp policy runs only after the signature checks out: validating
+	// a stamp on an unauthenticated body would spend a 768 KiB workblock
+	// on whatever a stranger sent.
+	if !d.validateInboundStamp(msg) {
 		return
 	}
 
