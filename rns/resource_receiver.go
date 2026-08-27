@@ -178,6 +178,22 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		linkSigning:        signing,
 		linkEncryption:     encryption,
 		OnAssembled: func(body []byte) {
+			// §10.11: a segment of a multi-segment transfer is not a
+			// deliverable body. Hold it until the last one lands, or the
+			// application receives a truncated payload it cannot tell
+			// apart from a complete one.
+			if adv.TotalSegments > 1 {
+				whole, err := t.segments.add(link.ID, adv, body, time.Now())
+				if err != nil {
+					t.logger.Printf("resource segment %d/%d on link %x: %v", adv.SegmentIndex, adv.TotalSegments, link.ID[:4], err)
+					return
+				}
+				if whole == nil {
+					t.logger.Printf("resource segment %d/%d assembled on link %x, awaiting the rest", adv.SegmentIndex, adv.TotalSegments, link.ID[:4])
+					return
+				}
+				body = whole
+			}
 			// A Resource carrying a §11.2 RESPONSE is answered by the
 			// request machinery, not handed to the link's data callback:
 			// the body is an RPC envelope, not application payload. The

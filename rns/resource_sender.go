@@ -32,16 +32,16 @@ type ResourceSender struct {
 	logger    Logger
 
 	// Identification — set at construction, immutable after.
-	resourceHash    []byte // h
-	randomR         []byte // r — 4-byte salt
-	bodyPrefix      []byte // 4-byte body prefix (separate random)
-	expectedProof   []byte // SHA256(plaintext_body || h)
-	originalLen     int    // d
-	transferLen     int    // t — encrypted byte length
-	parts           [][]byte // ciphertext slices per part
-	hashmap         []byte   // concatenated map_hashes
-	advBody         []byte   // pre-packed RESOURCE_ADV msgpack body
-	multihopID      []byte   // transport_id when peer is multi-hop, nil otherwise
+	resourceHash  []byte   // h
+	randomR       []byte   // r — 4-byte salt
+	bodyPrefix    []byte   // 4-byte body prefix (separate random)
+	expectedProof []byte   // SHA256(plaintext_body || h)
+	originalLen   int      // d
+	transferLen   int      // t — encrypted byte length
+	parts         [][]byte // ciphertext slices per part
+	hashmap       []byte   // concatenated map_hashes
+	advBody       []byte   // pre-packed RESOURCE_ADV msgpack body
+	multihopID    []byte   // transport_id when peer is multi-hop, nil otherwise
 
 	// linkSigning/linkEncryption are snapshotted at construction —
 	// the link's session keys at the moment the resource was built.
@@ -101,6 +101,17 @@ func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 //
 // requestID nil / rpcFlags 0 gives the plain form.
 func NewRPCResourceSender(t *Transport, link *Link, body []byte, transportID []byte, logger Logger, requestID []byte, rpcFlags byte) (*ResourceSender, error) {
+	return newResourceSender(t, link, body, transportID, logger, requestID, rpcFlags, 1, 1, nil)
+}
+
+// newSegmentSender builds one segment of a §10.11 multi-segment
+// transfer. originalHash is the FIRST segment's hash, carried by every
+// segment as `o`; pass nil for segment 1, whose own hash becomes it.
+func newSegmentSender(t *Transport, link *Link, body, transportID []byte, index, total int, originalHash []byte) (*ResourceSender, error) {
+	return newResourceSender(t, link, body, transportID, t.logger, nil, 0, index, total, originalHash)
+}
+
+func newResourceSender(t *Transport, link *Link, body []byte, transportID []byte, logger Logger, requestID []byte, rpcFlags byte, segmentIndex, totalSegments int, originalHash []byte) (*ResourceSender, error) {
 	if t == nil || link == nil {
 		return nil, errors.New("resource sender: nil transport or link")
 	}
@@ -195,9 +206,9 @@ func NewRPCResourceSender(t *Transport, link *Link, body []byte, transportID []b
 		NumParts:      len(parts),
 		Hash:          hash,
 		RandomHash:    randomR,
-		OriginalHash:  hash,
-		SegmentIndex:  1,
-		TotalSegments: 1,
+		OriginalHash:  originalHashOr(originalHash, hash),
+		SegmentIndex:  segmentIndex,
+		TotalSegments: totalSegments,
 		Flags:         int(ResourceFlagEncrypted | rpcFlags),
 		RequestID:     requestID,
 		Hashmap:       hashmap,
@@ -207,25 +218,25 @@ func NewRPCResourceSender(t *Transport, link *Link, body []byte, transportID []b
 	}
 
 	rs := &ResourceSender{
-		transport:        t,
-		link:             link,
-		logger:           logger,
-		resourceHash:     hash,
-		randomR:          randomR,
-		bodyPrefix:       bodyPrefix,
-		expectedProof:    expectedProof,
-		originalLen:      len(body),
-		transferLen:      len(wireBlob),
-		parts:            parts,
-		hashmap:          hashmap,
-		advBody:          advBody,
-		multihopID:       transportID,
-		linkSigning:      signing,
-		linkEncryption:   encryption,
-		reqCh:            make(chan *ResourceRequest, 8),
-		prfCh:            make(chan *ResourceProof, 1),
-		cancelCh:         make(chan struct{}, 1),
-		done:             make(chan struct{}),
+		transport:      t,
+		link:           link,
+		logger:         logger,
+		resourceHash:   hash,
+		randomR:        randomR,
+		bodyPrefix:     bodyPrefix,
+		expectedProof:  expectedProof,
+		originalLen:    len(body),
+		transferLen:    len(wireBlob),
+		parts:          parts,
+		hashmap:        hashmap,
+		advBody:        advBody,
+		multihopID:     transportID,
+		linkSigning:    signing,
+		linkEncryption: encryption,
+		reqCh:          make(chan *ResourceRequest, 8),
+		prfCh:          make(chan *ResourceProof, 1),
+		cancelCh:       make(chan struct{}, 1),
+		done:           make(chan struct{}),
 	}
 	rs.state.Store(int32(ResourceStateQueued))
 
@@ -591,3 +602,12 @@ func buildResourceCtxPacket(linkID, body []byte, context byte, isProof bool) (*P
 	}, nil
 }
 
+// originalHashOr returns the transfer-wide `o` value: the first
+// segment's hash when one was supplied, else this segment's own (which
+// is the single-segment case, and the first segment of a multi).
+func originalHashOr(original, own []byte) []byte {
+	if len(original) > 0 {
+		return original
+	}
+	return own
+}

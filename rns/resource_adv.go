@@ -160,9 +160,13 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 	// than MaxEfficientSize is split by RNS into l>1 segments (§10.11);
 	// accepting one segment of such a transfer would hand a truncated
 	// body to the LXMF parser. Reject the whole transfer up front.
-	if adv.TotalSegments > 1 {
-		return nil, fmt.Errorf("%w: multi-segment resource (l=%d) — fwdsvc accepts single-segment only",
-			ErrResourceTooLarge, adv.TotalSegments)
+	// Multi-segment transfers (§10.11) are accepted and reassembled by
+	// segmentAssembler. The per-advertisement caps below bound ONE
+	// segment, so the segment count needs its own ceiling: a peer can
+	// offer a legal 1 MiB segment and simply claim a large `l`.
+	if adv.TotalSegments > MaxAcceptedResourceSegments {
+		return nil, fmt.Errorf("%w: %d segments, cap is %d",
+			ErrResourceTooLarge, adv.TotalSegments, MaxAcceptedResourceSegments)
 	}
 	if adv.TransferSize > MaxAcceptedResourceSize || adv.DataSize > MaxAcceptedResourceSize {
 		return nil, fmt.Errorf("%w: t=%d d=%d cap=%d hash=%s",
