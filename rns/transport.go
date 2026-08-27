@@ -52,6 +52,10 @@ type Transport struct {
 	// arrive as independent Resource transfers.
 	segments *segmentAssembler
 
+	// channels holds the §6.8 Channel per link, keyed by hex(link_id).
+	channelMu sync.Mutex
+	channels  map[string]*Channel
+
 	// pinned holds destinations protected from cache eviction, keyed by
 	// hex dest_hash. See PinDestinations.
 	pinned map[string]struct{}
@@ -1130,6 +1134,11 @@ func (t *Transport) handleLinkData(p *Packet) {
 		// usually has at most one inbound resource per link in
 		// flight, so the walk is short.
 		t.handleResourcePart(p)
+		return
+	case ContextChannel:
+		// SPEC §6.8 — a message-typed stream message. Consumed here and
+		// dispatched to the link's Channel by message type.
+		t.handleChannel(p)
 		return
 	case ContextRequest:
 		// SPEC §11.1 — an over-Link RPC call. Consumed here: the
