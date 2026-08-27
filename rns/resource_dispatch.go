@@ -257,7 +257,18 @@ func (t *Transport) SendResourceOverLink(ctx context.Context, link *Link, body [
 	if link == nil {
 		return errors.New("SendResourceOverLink: nil link")
 	}
-	rs, err := NewResourceSender(t, link, body, transportID, t.logger)
+	return t.sendRPCResourceOverLink(ctx, link, body, transportID, nil, 0)
+}
+
+// sendRPCResourceOverLink is SendResourceOverLink for a Resource that
+// carries a §11 REQUEST or RESPONSE, labelling the advertisement with
+// the request_id (`q`) and the is_request/is_response flag (§10.4) so
+// the far side routes the assembled body to the request machinery.
+func (t *Transport) sendRPCResourceOverLink(ctx context.Context, link *Link, body, transportID, requestID []byte, rpcFlags byte) error {
+	if link == nil {
+		return errors.New("sendRPCResourceOverLink: nil link")
+	}
+	rs, err := NewRPCResourceSender(t, link, body, transportID, t.logger, requestID, rpcFlags)
 	if err != nil {
 		return err
 	}
