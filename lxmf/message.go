@@ -119,6 +119,20 @@ type Message struct {
 	// or verifying it as a 4-element one diverges from every other client.
 	stampElement bool
 
+	// StampChecked reports whether the receive path actually evaluated
+	// the stamp. False means no check was attempted — we require no
+	// stamp, or validation was shed under load — NOT that the stamp was
+	// absent. StampValid is meaningless unless this is true.
+	StampChecked bool
+
+	// StampValid reports whether the stamp cleared the required cost.
+	StampValid bool
+
+	// StampValue is the leading-zero count the stamp actually achieved
+	// (§5.7.2 step 3). It can exceed the required cost — surplus work a
+	// sender chose to spend, which an application may use to prioritise.
+	StampValue int
+
 	// rawPayload preserves the exact msgpack bytes as received, for use in
 	// Verify per the SPEC §5.6 dual-variant tolerance rule.
 	rawPayload []byte
