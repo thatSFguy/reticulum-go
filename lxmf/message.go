@@ -257,6 +257,14 @@ type StampOptions struct {
 	// MaxDeliveryStampCost. See that constant for why a cap is mandatory
 	// on a stranger-supplied cost.
 	MaxCost int
+
+	// Ticket, when set, replaces the grind entirely: the stamp becomes
+	// SHA-256(ticket || message_id) truncated to TicketStampSize
+	// (§5.7.3). Upstream checks for an outbound ticket BEFORE it looks
+	// at stamp_cost (LXMessage.py:297-305), so a ticket applies even to
+	// a recipient who announced no cost — which is what lets a ticket
+	// holder keep proving the relationship for free.
+	Ticket []byte
 }
 
 func (o StampOptions) maxCost() int {
@@ -295,6 +303,15 @@ func packSignedAndStamped(senderID *rns.Identity, senderDestHash, destHash []byt
 // message on SIZE does so before paying for the proof-of-work — see
 // signAndPackOpportunisticAt.
 func applyStamp(payload, msgID []byte, opts StampOptions) ([]byte, error) {
+	// Ticket first, matching upstream's ordering: a ticket short-
+	// circuits the cost check rather than being an alternative to it.
+	if len(opts.Ticket) == TicketLength {
+		stamp, err := TicketStamp(opts.Ticket, msgID)
+		if err != nil {
+			return nil, err
+		}
+		return appendStamp(payload, stamp)
+	}
 	if opts.Cost <= 0 {
 		return payload, nil
 	}
@@ -321,8 +338,13 @@ func applyStamp(payload, msgID []byte, opts StampOptions) ([]byte, error) {
 const stampPayloadOverhead = 2 + StampSize
 
 func appendStamp(payload, stamp []byte) ([]byte, error) {
-	if len(stamp) != StampSize {
-		return nil, fmt.Errorf("stamp must be %d bytes, got %d", StampSize, len(stamp))
+	// A stamp is either a StampSize proof-of-work value or a
+	// TicketStampSize ticket-derived one (§5.7.3). The ticket form is
+	// HALF the length — upstream derives it with truncated_hash — so a
+	// length check that only knows about StampSize refuses every
+	// ticket-stamped message we try to send.
+	if len(stamp) != StampSize && len(stamp) != TicketStampSize {
+		return nil, fmt.Errorf("stamp must be %d or %d bytes, got %d", StampSize, TicketStampSize, len(stamp))
 	}
 	if len(payload) == 0 || payload[0] != 0x94 {
 		return nil, errors.New("payload is not a 4-element msgpack fixarray")

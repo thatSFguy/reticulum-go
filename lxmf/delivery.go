@@ -145,6 +145,12 @@ type Delivery struct {
 	// false. Off by default, matching upstream's _enforce_stamps —
 	// §5.7.4's third row is the default behaviour, not the second.
 	EnforceStamps bool
+
+	// Tickets holds the §5.7.3 relationships in both directions:
+	// tickets peers granted us (used to stamp outbound for free) and
+	// tickets we granted them (used to validate their inbound stamps).
+	// Nil disables tickets entirely — every stamp is then proof-of-work.
+	Tickets *TicketStore
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -247,6 +253,19 @@ func (d *Delivery) stampOptionsFor(appData []byte) StampOptions {
 	return StampOptions{Cost: cost, MaxCost: d.MaxStampCost}
 }
 
+// stampOptionsForPeer is stampOptionsFor plus the §5.7.3 shortcut: if
+// the recipient has granted us a live ticket, it replaces the grind.
+func (d *Delivery) stampOptionsForPeer(appData, peerHash []byte) StampOptions {
+	opts := d.stampOptionsFor(appData)
+	if d.Tickets == nil || d.DisableOutboundStamps {
+		return opts
+	}
+	if t := d.Tickets.Held(peerHash, time.Now()); t != nil {
+		opts.Ticket = t
+	}
+	return opts
+}
+
 // SendWithID is Send but also returns the 32-byte LXMF message_id the
 // recipient will compute on parse (SPEC §5.4: H(dest||source||payload)).
 // Returned on success; on error the returned msgID is nil. Used by the
@@ -266,7 +285,7 @@ func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, f
 	// it is resolved once here and reused by whichever route we take —
 	// re-deriving it inside sendOverLink would grind the proof-of-work a
 	// second time for every message that overflows the packet cap.
-	opts := d.stampOptionsFor(known.AppData)
+	opts := d.stampOptionsForPeer(known.AppData, recipientDestHash)
 
 	// Try opportunistic first. The size check runs on the STAMPED payload
 	// (a stamp costs 34 bytes of the 295-byte budget), so a stamped
@@ -405,7 +424,7 @@ func (d *Delivery) SendPropagated(nodeDestHash, recipientDestHash []byte, title,
 	lxmfData, transientID, packedID, err := SignAndPackPropagatedStamped(
 		d.identity, d.destHash, recipientDestHash,
 		recipient.X25519Public(), identityHashFromPublic(recipient.PublicKey),
-		title, content, fields, d.stampOptionsFor(recipient.AppData))
+		title, content, fields, d.stampOptionsForPeer(recipient.AppData, recipientDestHash))
 	if err != nil {
 		return nil, fmt.Errorf("pack propagated: %w", err)
 	}
@@ -516,9 +535,11 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 		d.errorf("verify: %w", err)
 		return
 	}
-	// Stamp policy runs only after the signature checks out: validating
+	// Both of these run only after the signature checks out: validating
 	// a stamp on an unauthenticated body would spend a 768 KiB workblock
-	// on whatever a stranger sent.
+	// on whatever a stranger sent, and remembering a ticket from one
+	// would let anybody grant themselves free delivery in our name.
+	d.rememberInboundTicket(msg)
 	if !d.validateInboundStamp(msg) {
 		return
 	}

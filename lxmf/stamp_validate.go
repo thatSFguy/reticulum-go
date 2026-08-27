@@ -1,8 +1,10 @@
 package lxmf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // SPEC §5.7.2 step 3 / §5.7.4 — inbound stamp validation.
@@ -87,6 +89,27 @@ func (d *Delivery) validateInboundStamp(m *Message) bool {
 	default:
 		d.errorf("stamp validation skipped: %d concurrent validations already running", MaxConcurrentStampValidations)
 		return true
+	}
+
+	// §5.7.3 first: a stamp matching any ticket we issued this sender is
+	// valid regardless of cost, and scores the COST_TICKET sentinel
+	// rather than a real leading-zero count. Upstream checks tickets
+	// before proof-of-work (LXMessage.py:273-283); checking PoW first
+	// would spend a 768 KiB workblock on a message we were going to
+	// accept for free anyway.
+	if d.Tickets != nil && len(m.Stamp) == TicketStampSize {
+		for _, ticket := range d.Tickets.Issued(m.SourceHash, time.Now()) {
+			want, err := TicketStamp(ticket, m.MessageID())
+			if err != nil {
+				continue
+			}
+			if bytes.Equal(want, m.Stamp) {
+				m.StampChecked = true
+				m.StampValid = true
+				m.StampValue = CostTicket
+				return true
+			}
+		}
 	}
 
 	value, err := m.ValidateStamp(cost)

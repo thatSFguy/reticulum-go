@@ -41,7 +41,7 @@ func TestStampOptionsFromAnnounce(t *testing.T) {
 		{"per-delivery ceiling rides along", Delivery{MaxStampCost: 4}, costOf(9), StampOptions{Cost: 9, MaxCost: 4}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := c.d.stampOptionsFor(c.appData); got != c.want {
+			if got := c.d.stampOptionsFor(c.appData); got.Cost != c.want.Cost || got.MaxCost != c.want.MaxCost {
 				t.Errorf("stampOptionsFor = %+v, want %+v", got, c.want)
 			}
 		})
@@ -58,7 +58,7 @@ func TestStampOptionsReportsMalformedAppData(t *testing.T) {
 
 	// [name, "not an int"] — element [1] present but not a stamp_cost.
 	bad := []byte{0x92, 0xc4, 0x04, 'p', 'e', 'e', 'r', 0xa3, 'b', 'a', 'd'}
-	if got := d.stampOptionsFor(bad); got != (StampOptions{}) {
+	if got := d.stampOptionsFor(bad); got.Cost != 0 || got.MaxCost != 0 {
 		t.Errorf("stampOptionsFor = %+v, want zero (fall back to unstamped)", got)
 	}
 	if reported == nil {
