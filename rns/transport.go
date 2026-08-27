@@ -170,10 +170,32 @@ type KnownIdentity struct {
 	// directly (HEADER_1). Used by Delivery.Send to decide whether to
 	// emit HEADER_2 with TransportType=NetworkTransport (SPEC §2.3).
 	TransportID []byte `json:"transport_id,omitempty"`
+
+	// RatchetPub is the peer's currently-announced X25519 ratchet
+	// public key (§4.2, context_flag = 1), or nil when they publish
+	// none. Senders encrypt to this in preference to the long-term key
+	// so a later long-term compromise cannot decrypt what we sent
+	// under a rotated-out ratchet (§7.3).
+	//
+	// It is carried inside signed_data, so a peer cannot have a ratchet
+	// substituted in transit — but it is still THEIR claim, and losing
+	// it only costs forward secrecy, never delivery: §3 permits falling
+	// back to the long-term key.
+	RatchetPub []byte `json:"ratchet_pub,omitempty"`
 }
 
 // X25519Public returns the first 32 bytes of PublicKey — the X25519 half.
 func (k *KnownIdentity) X25519Public() []byte { return k.PublicKey[:32] }
+
+// EncryptionPublic returns the X25519 key an outbound token should be
+// encrypted to: the peer's announced ratchet when they publish one,
+// their long-term key otherwise (§3 step 2).
+func (k *KnownIdentity) EncryptionPublic() []byte {
+	if len(k.RatchetPub) == ratchetPrivLen {
+		return append([]byte(nil), k.RatchetPub...)
+	}
+	return k.X25519Public()
+}
 
 // Ed25519Public returns the last 32 bytes of PublicKey.
 func (k *KnownIdentity) Ed25519Public() []byte { return k.PublicKey[32:] }
@@ -351,6 +373,7 @@ func (t *Transport) Restore(k *KnownIdentity) {
 		AppData:    append([]byte(nil), k.AppData...),
 		LastSeen:   k.LastSeen,
 		LastRandom: append([]byte(nil), k.LastRandom...),
+		RatchetPub: append([]byte(nil), k.RatchetPub...),
 		Hops:       k.Hops,
 		EmittedAt:  k.EmittedAt,
 	}
@@ -687,6 +710,12 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	prev.AppData = append([]byte(nil), a.AppData...)
 	prev.LastSeen = now
 	prev.LastRandom = append([]byte(nil), a.RandomHash...)
+	// §7.3: a ratchet is published per announce and rotates on the
+	// sender's cadence. An announce WITHOUT one clears the stored
+	// value rather than keeping the last — a peer that stopped
+	// publishing ratchets can no longer decrypt tokens encrypted to
+	// one, so continuing to use it would silently black-hole them.
+	prev.RatchetPub = append([]byte(nil), a.RatchetPub...)
 
 	// ROUTING STATE IS UNSIGNED. hops and transport_id come from the
 	// outer packet header and are NOT covered by the announce

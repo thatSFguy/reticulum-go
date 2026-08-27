@@ -70,6 +70,7 @@ go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
 | Identity, destination hashes, signing | `rns/identity.go` |
 | Packet header encode/decode (SPEC §2) | `rns/packet.go` |
 | Token crypto — modified Fernet (§3) | `rns/token.go`, `rns/link_token.go` |
+| Ratchets — rotation, ring, decrypt (§7.3, §7.4) | `rns/ratchet.go` |
 | Announce wire format + LXMF app_data (§4) | `rns/announce.go` |
 | Link handshake / state machine / data (§6) | `rns/link.go`, `rns/link_state.go`, `rns/link_data.go` |
 | Proofs (§6.6) | `rns/proof.go` |

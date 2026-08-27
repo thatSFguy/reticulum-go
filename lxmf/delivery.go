@@ -151,6 +151,22 @@ type Delivery struct {
 	// tickets we granted them (used to validate their inbound stamps).
 	// Nil disables tickets entirely — every stamp is then proof-of-work.
 	Tickets *TicketStore
+
+	// Ratchets, when set, publishes an X25519 ratchet in our announces
+	// and is tried on inbound decrypt before the long-term key (§7.3,
+	// §7.4). Nil means no ratchet: everything still works, and every
+	// message we receive stays decryptable by our long-term key
+	// forever, which is exactly the forward secrecy a ratchet buys.
+	Ratchets *rns.RatchetKeeper
+}
+
+// decryptInbound opens an inbound token, trying our ratchet ring
+// before the long-term key (§7.4).
+func (d *Delivery) decryptInbound(ciphertext []byte) ([]byte, error) {
+	if d.Ratchets == nil {
+		return rns.TokenDecrypt(d.identity, ciphertext)
+	}
+	return rns.TokenDecryptWithRatchets(d.identity, ciphertext, d.Ratchets.PrivateKeys())
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -301,7 +317,10 @@ func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, f
 
 	// Recipient's identity hash drives the Token HKDF salt (SPEC §3.2).
 	recipientIdentityHash := identityHashFromPublic(known.PublicKey)
-	ciphertext, err := rns.TokenEncrypt(body, known.X25519Public(), recipientIdentityHash)
+	// §3 step 2 / §7.3: encrypt to the peer's announced ratchet when
+	// they publish one, so a later compromise of their long-term key
+	// cannot decrypt this message.
+	ciphertext, err := rns.TokenEncrypt(body, known.EncryptionPublic(), recipientIdentityHash)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt: %w", err)
 	}
@@ -423,7 +442,7 @@ func (d *Delivery) SendPropagated(nodeDestHash, recipientDestHash []byte, title,
 	// after it survived the whole store-and-forward trip.
 	lxmfData, transientID, packedID, err := SignAndPackPropagatedStamped(
 		d.identity, d.destHash, recipientDestHash,
-		recipient.X25519Public(), identityHashFromPublic(recipient.PublicKey),
+		recipient.EncryptionPublic(), identityHashFromPublic(recipient.PublicKey),
 		title, content, fields, d.stampOptionsForPeer(recipient.AppData, recipientDestHash))
 	if err != nil {
 		return nil, fmt.Errorf("pack propagated: %w", err)
@@ -507,7 +526,7 @@ func buildOutboundPacket(recipientDestHash, ciphertext, transportID []byte) *rns
 // addressed to our destination hash. It does Token decrypt + LXMF parse
 // + signature verify, then fires OnMessage on success.
 func (d *Delivery) handleInbound(p *rns.Packet) {
-	plain, err := rns.TokenDecrypt(d.identity, p.Data)
+	plain, err := d.decryptInbound(p.Data)
 	if err != nil {
 		d.errorf("decrypt: %w", err)
 		return
