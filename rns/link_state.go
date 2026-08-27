@@ -55,6 +55,19 @@ type Link struct {
 	ID    []byte // 16-byte link_id (SPEC §6.3)
 	State LinkState
 
+	// MTU is the link MTU confirmed by the §6.6 handshake — the
+	// responder adopts what the (relay-clamped) LINKREQUEST signalled,
+	// the initiator adopts what the LRPROOF confirmed, exactly as
+	// upstream does in Link.validate_request and Link.validate_proof
+	// (RNS/Link.py:186-200, 404-424). Zero means the peer sent no
+	// signalling, i.e. the base ReticulumMTU.
+	//
+	// It is recorded because §10.2 step 6 sizes Resource parts from it:
+	// a peer whose link negotiated a larger MTU slices its transfer into
+	// correspondingly larger parts, and a receiver that assumes the base
+	// MTU mis-measures every one of them.
+	MTU uint32
+
 	// Session keys derived from the handshake (SPEC §6.4). 32 bytes each;
 	// signing is also used as the Ed25519 seed for link-DATA proofs.
 	Signing    []byte
@@ -535,6 +548,23 @@ func (lm *LinkManager) StartLinkAsInitiator(responderDestHash []byte, sig *LinkS
 // responder's long-term Ed25519 pub is supplied separately because both
 // sides know it from the responder's prior announce — it's NOT on the
 // LRPROOF wire (SPEC §6.2).
+// SDU returns the Resource part size this link's peer slices to:
+// mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE (SPEC §10.2 step 6, upstream
+// Resource.py:335). Falls back to the base ResourceSDU when the
+// handshake carried no MTU signalling, and never returns less than it —
+// a peer that signalled an implausibly small MTU still sends at least
+// base-sized parts, and under-measuring them would reject a transfer
+// that is perfectly legal.
+func (l *Link) SDU() int {
+	l.mu.Lock()
+	mtu := l.MTU
+	l.mu.Unlock()
+	sdu := int(mtu) - ReticulumHeaderMaxSize - ReticulumIFACMinSize
+	if sdu < ResourceSDU {
+		return ResourceSDU
+	}
+	return sdu
+}
 func (lm *LinkManager) HandleLRProof(p *Packet, responderEd25519Pub []byte) (*Link, error) {
 	parsed, err := ParseLRProof(p)
 	if err != nil {
@@ -564,6 +594,14 @@ func (lm *LinkManager) HandleLRProof(p *Packet, responderEd25519Pub []byte) (*Li
 	}
 	l.Signing = signing
 	l.Encryption = encryption
+	// Upstream: self.mtu = confirmed_mtu or Reticulum.MTU
+	// (RNS/Link.py:422). The responder's LRPROOF is the authoritative
+	// end of the §6.6 negotiation — its signature commits to these
+	// bytes — so the confirmed value, not what we proposed, is the one
+	// that sizes this link's Resource parts.
+	if parsed.Signalling != nil {
+		l.MTU = parsed.Signalling.MTU
+	}
 	l.State = LinkActive
 	l.LastActivity = time.Now()
 	l.myEphemeralX25519Priv = nil // no longer needed
@@ -629,9 +667,19 @@ func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identi
 		return nil, nil, fmt.Errorf("BuildLRProof: %w", err)
 	}
 
+	// Upstream: link.mtu = mtu_from_lr_packet(packet) or Reticulum.MTU
+	// (RNS/Link.py:192-197). By §6.6 the value reaching us is already
+	// clamped by any transit relay to its next-hop view, so an endpoint
+	// responder adopts it as-is — and then signals it back in the
+	// LRPROOF, which is what the initiator will size its parts to.
+	var mtu uint32
+	if sig != nil {
+		mtu = sig.MTU
+	}
 	l := &Link{
 		ID:                 id,
 		State:              LinkActive,
+		MTU:                mtu,
 		Signing:            signing,
 		Encryption:         encryption,
 		myResponderEphPriv: respEphPriv, // kept around in case we want to renegotiate
