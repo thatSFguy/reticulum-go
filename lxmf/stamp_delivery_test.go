@@ -187,13 +187,25 @@ func TestAppendStampRejectsNonFourElementPayload(t *testing.T) {
 		{"already stamped", []byte{0x95, 0x00}, stamp},
 		{"not an array", []byte{0xc0}, stamp},
 		{"empty", nil, stamp},
-		{"short stamp", []byte{0x94, 0x00}, stamp[:16]},
+		// 16 bytes is the VALID ticket-stamp length (§5.7.3), so the
+		// wrong-length case has to be a length that is neither.
+		{"stamp of neither valid length", []byte{0x94, 0x00}, stamp[:20]},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := appendStamp(c.payload, c.stamp); err == nil {
 				t.Error("accepted an invalid splice input")
 			}
 		})
+	}
+
+	// Both legitimate stamp lengths must splice: StampSize for
+	// proof-of-work and TicketStampSize for the §5.7.3 ticket form,
+	// which is half as long because upstream derives it with
+	// truncated_hash.
+	for _, n := range []int{StampSize, TicketStampSize} {
+		if _, err := appendStamp([]byte{0x94, 0x00}, bytes.Repeat([]byte{0x02}, n)); err != nil {
+			t.Errorf("appendStamp rejected a %d-byte stamp: %v", n, err)
+		}
 	}
 }
 
