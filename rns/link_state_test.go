@@ -421,3 +421,85 @@ func TestResponderCapLeavesHeadroomForOutbound(t *testing.T) {
 			MaxResponderLinks, MaxConcurrentLinks)
 	}
 }
+
+// makeLinkPair returns two identities, their managers, and the
+// responder's destination hash — the setup every handshake test repeats.
+func makeLinkPair(t *testing.T) (alice, bob *Identity, aliceMgr, bobMgr *LinkManager, bobDest []byte) {
+	t.Helper()
+	alice, _ = NewIdentity()
+	bob, _ = NewIdentity()
+	bobDest = bob.DestinationHashFor(FullName("vectors", "link"))
+	return alice, bob, NewLinkManager(), NewLinkManager(), bobDest
+}
+
+// TestHandshakeRecordsNegotiatedMTU covers the §6.6 plumbing end to end
+// in both roles. Upstream records the settled MTU on the link
+// (Link.validate_request sets it from the LINKREQUEST, validate_proof
+// from the confirmed LRPROOF) because §10.2 step 6 sizes Resource parts
+// from it. We mirror the signalling bytes for signature symmetry, so
+// before this both sides agreed on the wire and then discarded the
+// value — leaving the receiver to measure inbound parts against the
+// base MTU.
+func TestHandshakeRecordsNegotiatedMTU(t *testing.T) {
+	const negotiated = 1064
+
+	t.Run("responder adopts what the request signalled", func(t *testing.T) {
+		alice, bob, aliceMgr, bobMgr, bobDest := makeLinkPair(t)
+		_ = alice
+		_, lrReq, err := aliceMgr.StartLinkAsInitiator(bobDest, &LinkSignalling{MTU: negotiated, Mode: LinkModeAES256CBC})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// sig == nil is the mirror path the Transport uses.
+		bobLink, _, err := bobMgr.AcceptIncomingLinkRequest(lrReq, bob, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bobLink.MTU != negotiated {
+			t.Errorf("responder link MTU = %d, want %d", bobLink.MTU, negotiated)
+		}
+		want := negotiated - ReticulumHeaderMaxSize - ReticulumIFACMinSize
+		if got := bobLink.SDU(); got != want {
+			t.Errorf("responder SDU = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("initiator adopts what the proof confirmed", func(t *testing.T) {
+		_, bob, aliceMgr, bobMgr, bobDest := makeLinkPair(t)
+		aliceLink, lrReq, err := aliceMgr.StartLinkAsInitiator(bobDest, &LinkSignalling{MTU: negotiated, Mode: LinkModeAES256CBC})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, lrProof, err := bobMgr.AcceptIncomingLinkRequest(lrReq, bob, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := aliceMgr.HandleLRProof(lrProof, bob.PublicKey()[32:]); err != nil {
+			t.Fatal(err)
+		}
+		if aliceLink.MTU != negotiated {
+			t.Errorf("initiator link MTU = %d, want %d", aliceLink.MTU, negotiated)
+		}
+	})
+
+	t.Run("no signalling stays at the base SDU", func(t *testing.T) {
+		_, bob, aliceMgr, bobMgr, bobDest := makeLinkPair(t)
+		aliceLink, lrReq, err := aliceMgr.StartLinkAsInitiator(bobDest, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bobLink, lrProof, err := bobMgr.AcceptIncomingLinkRequest(lrReq, bob, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := aliceMgr.HandleLRProof(lrProof, bob.PublicKey()[32:]); err != nil {
+			t.Fatal(err)
+		}
+		if bobLink.MTU != 0 || aliceLink.MTU != 0 {
+			t.Errorf("MTU recorded without signalling: responder %d, initiator %d", bobLink.MTU, aliceLink.MTU)
+		}
+		if got := bobLink.SDU(); got != ResourceSDU {
+			t.Errorf("SDU = %d, want base %d", got, ResourceSDU)
+		}
+	})
+}

@@ -76,7 +76,17 @@ type ResourceReceiver struct {
 	// Indexed by hashmap position (0-based).
 	parts         [][]byte
 	receivedCount int
-	receivedBytes int    // running total of placed part lengths
+	receivedBytes int // running total of placed part lengths
+
+	// partSDU is the largest a single part may be: this LINK's SDU, not
+	// the base one. Upstream sizes the same value per link —
+	// `self.sdu = link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE`
+	// (RNS/Resource.py:335) — so a peer whose §6.6 handshake negotiated a
+	// larger MTU legitimately sends larger parts. Measuring those against
+	// the base SDU rejects every one of them, and since the receive loop
+	// just drops a part it cannot place, the transfer would stall and
+	// time out looking like an unresponsive peer.
+	partSDU       int
 	receivedFlags []bool // parts[i] arrived?
 
 	// Channels: dispatcher → receiver goroutine.
@@ -153,6 +163,7 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		resourceHash:       append([]byte(nil), adv.Hash...),
 		randomR:            append([]byte(nil), adv.RandomHash...),
 		expectedSize:       adv.TransferSize,
+		partSDU:            link.SDU(),
 		dataSize:           adv.DataSize,
 		flags:              adv.Flags,
 		hashmap:            fullHashmap,
@@ -425,12 +436,20 @@ var (
 func (rr *ResourceReceiver) placePart(part []byte) error {
 	// A legitimate part is one SDU-sized slice of the encrypted body
 	// (SPEC §10.2 step 6), so anything larger is malformed or hostile.
-	// Rejecting it here, before it is buffered, keeps the parts table
-	// within the budget the ADV bought: ParseResourceAdv caps the part
-	// COUNT, and this caps each part's SIZE, so the two together bound
-	// what one transfer can hold.
-	if len(part) > ResourceSDU {
-		return fmt.Errorf("%w: %d > %d bytes", errResourcePartOversize, len(part), ResourceSDU)
+	// The SDU is per-LINK — see partSDU — so this must measure against
+	// what this link negotiated, never the base constant.
+	//
+	// This is a conformance check, not the memory bound: the running
+	// total below is what actually caps allocation. Upstream imposes
+	// neither (RNS/Resource.py::receive_part just places the part); both
+	// are the receive-path allocation limits SPEC §16.8 asks a
+	// category-3 implementation to impose for itself.
+	maxPart := rr.partSDU
+	if maxPart <= 0 {
+		maxPart = ResourceSDU
+	}
+	if len(part) > maxPart {
+		return fmt.Errorf("%w: %d > %d bytes", errResourcePartOversize, len(part), maxPart)
 	}
 
 	mh := ResourceMapHash(part, rr.randomR)
