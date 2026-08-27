@@ -264,3 +264,97 @@ func (a *AutoInterface) Close() error {
 // PeerKey is the map key a peer address is tracked under, exposed for
 // tests and diagnostics.
 func PeerKey(addr string) string { return hex.EncodeToString([]byte(addr)) }
+
+// Start binds the discovery and data sockets on `ifaceName` and begins
+// announcing.
+//
+// This is the part that needs a real network: an IPv6 link-local
+// multicast join on a specific interface. Everything above it —
+// derivations, token verification, the peer table, fan-out — works
+// without one and is tested; this is not.
+func (a *AutoInterface) Start(ifaceName, linkLocalAddr string, announceEvery time.Duration) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", ifaceName, err)
+	}
+	group := &net.UDPAddr{IP: net.ParseIP(a.MulticastAddress()), Port: a.discoveryPort}
+	if group.IP == nil {
+		return fmt.Errorf("derived multicast address %q is not parseable", a.MulticastAddress())
+	}
+
+	disc, err := net.ListenMulticastUDP("udp6", iface, group)
+	if err != nil {
+		return fmt.Errorf("join %s on %s: %w", group.IP, ifaceName, err)
+	}
+	data, err := net.ListenUDP("udp6", &net.UDPAddr{Port: a.dataPort})
+	if err != nil {
+		disc.Close()
+		return fmt.Errorf("bind data port %d: %w", a.dataPort, err)
+	}
+
+	go a.discoveryLoop(disc)
+	go a.dataLoop(data)
+	go a.announceLoop(group, ifaceName, linkLocalAddr, announceEvery)
+
+	go func() {
+		<-a.done
+		disc.Close()
+		data.Close()
+	}()
+	return nil
+}
+
+func (a *AutoInterface) discoveryLoop(conn *net.UDPConn) {
+	buf := make([]byte, 512)
+	for {
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		// The source address is what the token must bind to; strip any
+		// zone suffix, since that is local to us rather than part of
+		// what the peer hashed.
+		addr := src.IP.String()
+		if !a.HandleDiscovery(buf[:n], addr, time.Now()) {
+			// Not a peer of ours: a different group, or a replay from
+			// the wrong address. Silent — the multicast group is shared
+			// with anyone who can reach it.
+			continue
+		}
+	}
+}
+
+func (a *AutoInterface) dataLoop(conn *net.UDPConn) {
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		if n < header1MinLen {
+			continue
+		}
+		a.Deliver(buf[:n])
+	}
+}
+
+func (a *AutoInterface) announceLoop(group *net.UDPAddr, ifaceName, linkLocalAddr string, every time.Duration) {
+	if every <= 0 {
+		every = PeeringTimeout / 3
+	}
+	token := a.Token(linkLocalAddr)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		conn, err := net.DialUDP("udp6", nil, group)
+		if err == nil {
+			_, _ = conn.Write(token)
+			conn.Close()
+		}
+		select {
+		case <-ticker.C:
+		case <-a.done:
+			return
+		}
+	}
+}
