@@ -544,7 +544,20 @@ func (lm *LinkManager) HandleLinkIdentify(p *Packet) (*Link, []byte, error) {
 		return l, nil, errors.New("LINKIDENTIFY ignored; link already identified")
 	}
 
+	// Re-check under the SAME lock hold that assigns. The `already`
+	// read above happened before verification and is only a cheap early
+	// out; deciding on it would leave a window where two valid
+	// LINKIDENTIFYs both observe an unidentified link and the second
+	// overwrites the first. That window is closed today only because
+	// inbound packets are handled on one dispatcher goroutine — an
+	// accident of the Transport, not a property of this function, and
+	// the assign-once rule is what stops a peer re-identifying as
+	// somebody else mid-link.
 	l.mu.Lock()
+	if l.remoteIdentity != nil {
+		l.mu.Unlock()
+		return l, nil, errors.New("LINKIDENTIFY ignored; link already identified")
+	}
 	l.remoteIdentity = append([]byte(nil), pubKey...)
 	l.mu.Unlock()
 	return l, pubKey, nil

@@ -43,23 +43,28 @@ func (t *Transport) SendRequest(linkID []byte, path string, data any) (*RequestR
 	if err != nil {
 		return nil, err
 	}
-	if len(packed) > LinkMDU {
-		// Resource-form REQUESTs (§11.1, > link.mdu) are not implemented
-		// yet: the advertisement must carry request_id in `q` and the
-		// `u` is_request flag, which the Resource sender does not set.
-		return nil, fmt.Errorf("request envelope is %d bytes, over the %d-byte single-packet budget (Resource-form REQUEST not implemented)",
-			len(packed), LinkMDU)
-	}
+	// §11.1 dispatches on size, and the two forms derive request_id
+	// DIFFERENTLY: a single packet is identified by the hash of its own
+	// wire bytes, which a Resource has none of, so the Resource form
+	// hashes the packed envelope and carries the id explicitly in the
+	// advertisement's `q` (RNS/Link.py:504).
+	oversize := len(packed) > LinkMDU
 
-	pkt, err := BuildLinkDataPacket(linkID, signing, encryption, packed)
-	if err != nil {
-		return nil, err
-	}
-	pkt.Context = ContextRequest
-
-	requestID, err := RequestIDFromPacket(pkt)
-	if err != nil {
-		return nil, err
+	var requestID []byte
+	var pkt *Packet
+	if oversize {
+		requestID = RequestIDFromPacked(packed)
+	} else {
+		var err error
+		pkt, err = BuildLinkDataPacket(linkID, signing, encryption, packed)
+		if err != nil {
+			return nil, err
+		}
+		pkt.Context = ContextRequest
+		requestID, err = RequestIDFromPacket(pkt)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	receipt := &RequestReceipt{
@@ -74,6 +79,23 @@ func (t *Transport) SendRequest(linkID []byte, path string, data any) (*RequestR
 	}
 	t.pendingRequests[hex.EncodeToString(requestID)] = receipt
 	t.requestMu.Unlock()
+
+	if oversize {
+		// The transfer outlives this call, so it runs in the background
+		// and the caller waits on the receipt exactly as for the
+		// single-packet form.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(len(packed)))
+			defer cancel()
+			if err := t.sendRPCResourceOverLink(ctx, l, packed, nil, requestID, ResourceFlagIsRequest); err != nil {
+				t.logger.Printf("resource request %x on link %x: %v", requestID[:4], linkID[:4], err)
+				t.cancelPendingRequest(requestID)
+				receipt.deliver(requestResult{err: fmt.Errorf("resource request: %w", err)})
+			}
+		}()
+		t.logger.Printf("request %x sent on link %x path %q by Resource (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
+		return receipt, nil
+	}
 
 	if err := t.Broadcast(pkt); err != nil {
 		t.cancelPendingRequest(requestID)
@@ -105,9 +127,9 @@ func (t *Transport) takePendingRequest(requestID []byte) *RequestReceipt {
 	return r
 }
 
-// handleRequest processes an inbound §11.1 REQUEST: decrypt, parse,
-// find the handler, apply the §11.4 allow mode, and emit the §11.2
-// RESPONSE labelled with the request_id derived from THIS packet.
+// handleRequest processes an inbound SINGLE-PACKET §11.1 REQUEST:
+// decrypt, derive the request_id from this packet's wire bytes, and hand
+// off to the shared server logic.
 func (t *Transport) handleRequest(p *Packet) {
 	l := t.linkManager.Get(p.DestHash)
 	if l == nil {
@@ -128,6 +150,27 @@ func (t *Transport) handleRequest(p *Packet) {
 		t.logger.Printf("request decrypt: %v", err)
 		return
 	}
+	requestID, err := RequestIDFromPacket(p)
+	if err != nil {
+		t.logger.Printf("request id: %v", err)
+		return
+	}
+	t.serveRequest(l, plaintext, requestID)
+}
+
+// serveRequest is the form-agnostic server half: parse the envelope,
+// find the handler, apply the §11.4 allow mode, and emit the §11.2
+// RESPONSE labelled with requestID.
+//
+// The two REQUEST forms reach here having derived requestID differently
+// — a single packet from its own wire-byte hash, a Resource from the
+// advertisement's `q` — so it is passed in rather than recomputed.
+func (t *Transport) serveRequest(l *Link, plaintext, requestID []byte) {
+	l.mu.Lock()
+	signing, encryption := l.Signing, l.Encryption
+	linkID := append([]byte(nil), l.ID...)
+	l.mu.Unlock()
+
 	ts, pathHash, data, err := ParseRequest(plaintext)
 	if err != nil {
 		t.logger.Printf("request parse: %v", err)
@@ -138,20 +181,14 @@ func (t *Transport) handleRequest(p *Packet) {
 	if entry == nil {
 		// Upstream drops silently; log so an operator can see a client
 		// asking for a path this node does not serve.
-		t.logger.Printf("request: %v (path_hash %x on link %x)", ErrRequestNoHandler, pathHash[:4], p.DestHash[:4])
+		t.logger.Printf("request: %v (path_hash %x on link %x)", ErrRequestNoHandler, pathHash[:4], linkID[:4])
 		return
 	}
 
 	remote := l.RemoteIdentity()
 	if !entry.permits(remote) {
 		t.logger.Printf("request %q refused on link %x: %v (allow=%d, identified=%t)",
-			entry.path, p.DestHash[:4], ErrRequestNotAllowed, entry.allow, remote != nil)
-		return
-	}
-
-	requestID, err := RequestIDFromPacket(p)
-	if err != nil {
-		t.logger.Printf("request id: %v", err)
+			entry.path, linkID[:4], ErrRequestNotAllowed, entry.allow, remote != nil)
 		return
 	}
 
@@ -160,7 +197,7 @@ func (t *Transport) handleRequest(p *Packet) {
 		PathHash:       pathHash,
 		Data:           data,
 		Timestamp:      ts,
-		LinkID:         append([]byte(nil), p.DestHash...),
+		LinkID:         linkID,
 		RemoteIdentity: remote,
 	})
 	if err != nil {
@@ -183,16 +220,15 @@ func (t *Transport) handleRequest(p *Packet) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(len(packed)))
 			defer cancel()
-			var transportID []byte
-			if err := t.sendRPCResourceOverLink(ctx, l, packed, transportID, requestID, ResourceFlagIsResponse); err != nil {
+			if err := t.sendRPCResourceOverLink(ctx, l, packed, nil, requestID, ResourceFlagIsResponse); err != nil {
 				t.logger.Printf("resource response for %q: %v", entry.path, err)
 			}
 		}()
-		t.logger.Printf("request %q answered on link %x by Resource (id %x, %d bytes)", entry.path, p.DestHash[:4], requestID[:4], len(packed))
+		t.logger.Printf("request %q answered on link %x by Resource (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
 		return
 	}
 
-	respPkt, err := BuildLinkDataPacket(p.DestHash, signing, encryption, packed)
+	respPkt, err := BuildLinkDataPacket(linkID, signing, encryption, packed)
 	if err != nil {
 		t.logger.Printf("build response packet: %v", err)
 		return
@@ -202,7 +238,14 @@ func (t *Transport) handleRequest(p *Packet) {
 		t.logger.Printf("response broadcast: %v", err)
 		return
 	}
-	t.logger.Printf("request %q answered on link %x (id %x, %d bytes)", entry.path, p.DestHash[:4], requestID[:4], len(packed))
+	t.logger.Printf("request %q answered on link %x (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
+}
+
+// serveResourceRequest handles a §11.1 REQUEST that arrived as a
+// Resource. The advertisement carried the request_id in `q`; the
+// assembled body is the same envelope a single-packet REQUEST carries.
+func (t *Transport) serveResourceRequest(l *Link, requestID, body []byte) {
+	t.serveRequest(l, body, requestID)
 }
 
 // handleResponse processes an inbound §11.2 RESPONSE and hands it to
