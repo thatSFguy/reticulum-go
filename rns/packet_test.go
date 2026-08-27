@@ -286,3 +286,40 @@ func TestParseRejectsHopsOutOfBound(t *testing.T) {
 		}
 	}
 }
+
+// TestPackRefusesHopsAtTheLimit covers the emit half of SPEC §2.4, added
+// in RNS 1.5.0: Packet.send() returns False without packing at
+// hops >= PATHFINDER_M (Packet.py:288) and Transport._outbound rejects
+// the same before interface selection (Transport.py:1305). Before this
+// the bound was enforced only on receive, so we would happily emit a
+// packet every conformant peer drops as malformed.
+func TestPackRefusesHopsAtTheLimit(t *testing.T) {
+	base := func(hops byte) *Packet {
+		return &Packet{
+			HeaderType:      HeaderType1,
+			TransportType:   BroadcastTransport,
+			DestinationType: DestinationSingle,
+			PacketType:      PacketData,
+			Hops:            hops,
+			DestHash:        bytes.Repeat([]byte{0x11}, addressHashLen),
+			Data:            []byte("x"),
+		}
+	}
+	if _, err := base(maxWireHops - 1).Pack(); err != nil {
+		t.Errorf("hops %d refused, want accepted: %v", maxWireHops-1, err)
+	}
+	for _, hops := range []byte{maxWireHops, maxWireHops + 1, 255} {
+		if _, err := base(hops).Pack(); err == nil {
+			t.Errorf("Pack accepted hops=%d, want refusal (SPEC §2.4)", hops)
+		}
+	}
+	// The receive side already rejected these; both halves must agree.
+	raw, err := base(maxWireHops - 1).Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[1] = maxWireHops
+	if _, err := ParsePacket(raw); err == nil {
+		t.Error("ParsePacket accepted hops at the limit")
+	}
+}

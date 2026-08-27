@@ -455,10 +455,15 @@ func (rr *ResourceReceiver) placePart(part []byte) error {
 	mh := ResourceMapHash(part, rr.randomR)
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
-	base := rr.consecutiveHeight
-	if base < 0 {
-		base = 0
-	}
+	// Search from one past the completed frontier (SPEC §10.5, changed
+	// in RNS 1.5.0: `search_start = self.consecutive_completed_height+1`,
+	// Resource.py:868-870). Starting AT the frontier re-examined a slot
+	// already known to be full on every inbound part, and left the window
+	// covering one fewer outstanding slot than intended — a slightly
+	// higher chance of mis-placing a part under map_hash collision.
+	// consecutiveHeight is -1 until the first contiguous part lands, so
+	// this needs no clamp.
+	base := rr.consecutiveHeight + 1
 	end := base + CollisionGuardSize
 	if end > rr.hashmapKnownPrefix {
 		end = rr.hashmapKnownPrefix

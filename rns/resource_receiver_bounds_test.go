@@ -123,20 +123,83 @@ func TestPlacePartAcceptsATransferThatExactlyFits(t *testing.T) {
 
 // A retransmit must not be counted twice — otherwise a lossy link,
 // where retransmits are routine, would trip the cumulative bound on a
-// perfectly good transfer.
+// perfectly good transfer. Both dispositions a retransmit can get are
+// covered here, because SPEC §10.5 changed which one applies where:
+// since RNS 1.5.0 the search window starts one PAST the completed
+// frontier, so a part at or below it is no longer in the window to be
+// recognised as a duplicate. Either way it must not consume budget.
 func TestADuplicatePartDoesNotConsumeTheBudget(t *testing.T) {
-	partA := bytes.Repeat([]byte{0x0A}, 100)
-	partB := bytes.Repeat([]byte{0x0B}, 60)
-	rr := makeBoundedReceiver(t, [][]byte{partA, partB}, 160)
+	t.Run("still inside the search window", func(t *testing.T) {
+		partA := bytes.Repeat([]byte{0x0A}, 100)
+		partB := bytes.Repeat([]byte{0x0B}, 60)
+		rr := makeBoundedReceiver(t, [][]byte{partA, partB}, 160)
 
+		// B arrives first, so the frontier stays at -1 (A is missing)
+		// and B's slot is still within the window.
+		if err := rr.placePart(partB); err != nil {
+			t.Fatalf("first part: %v", err)
+		}
+		if err := rr.placePart(partB); !errors.Is(err, errResourceDuplicatePart) {
+			t.Fatalf("retransmit = %v, want errResourceDuplicatePart", err)
+		}
+		if err := rr.placePart(partA); err != nil {
+			t.Errorf("a retransmit consumed budget the real part needed: %v", err)
+		}
+		if got, want := buffered(rr), 160; got != want {
+			t.Errorf("buffered %d bytes, want %d", got, want)
+		}
+	})
+
+	t.Run("below the completed frontier", func(t *testing.T) {
+		partA := bytes.Repeat([]byte{0x0A}, 100)
+		partB := bytes.Repeat([]byte{0x0B}, 60)
+		rr := makeBoundedReceiver(t, [][]byte{partA, partB}, 160)
+
+		// A completes slot 0, advancing the frontier past it, so a
+		// retransmit of A now falls outside the search window.
+		if err := rr.placePart(partA); err != nil {
+			t.Fatalf("first part: %v", err)
+		}
+		if err := rr.placePart(partA); err == nil {
+			t.Fatal("retransmit below the frontier was placed")
+		}
+		if err := rr.placePart(partB); err != nil {
+			t.Errorf("a retransmit consumed budget the real part needed: %v", err)
+		}
+		if got, want := buffered(rr), 160; got != want {
+			t.Errorf("buffered %d bytes, want %d", got, want)
+		}
+	})
+}
+
+// TestSearchWindowStartsPastTheFrontier pins SPEC §10.5 as changed in
+// RNS 1.5.0 (`search_start = self.consecutive_completed_height+1`,
+// Resource.py:868-870). Starting AT the frontier re-examined a slot
+// already known to be full on every inbound part and left the window one
+// outstanding slot short. A receiver on the old bounds still
+// interoperates — the window is a receiver-private search hint, not a
+// negotiated value — so this guards the improvement, not the wire.
+func TestSearchWindowStartsPastTheFrontier(t *testing.T) {
+	partA := bytes.Repeat([]byte{0x0A}, 50)
+	partB := bytes.Repeat([]byte{0x0B}, 50)
+	rr := makeBoundedReceiver(t, [][]byte{partA, partB}, 100)
+
+	if rr.consecutiveHeight != -1 {
+		t.Fatalf("fresh receiver frontier = %d, want -1", rr.consecutiveHeight)
+	}
+	// At -1 the window must still start at slot 0, or the first part of
+	// every transfer would be unplaceable.
 	if err := rr.placePart(partA); err != nil {
-		t.Fatalf("first part: %v", err)
+		t.Fatalf("first part rejected from a fresh receiver: %v", err)
 	}
-	if err := rr.placePart(partA); !errors.Is(err, errResourceDuplicatePart) {
-		t.Fatalf("retransmit = %v, want errResourceDuplicatePart", err)
+	if rr.consecutiveHeight != 0 {
+		t.Fatalf("frontier = %d after slot 0 filled, want 0", rr.consecutiveHeight)
 	}
+	// Now that slot 0 is complete the scan must begin at slot 1: the
+	// next part still places, and the completed slot is no longer
+	// re-examined (covered by the retransmit case above).
 	if err := rr.placePart(partB); err != nil {
-		t.Errorf("a retransmit consumed budget the real part needed: %v", err)
+		t.Errorf("second part rejected: %v", err)
 	}
 }
 
