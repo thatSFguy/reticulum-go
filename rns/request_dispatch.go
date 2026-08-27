@@ -1,0 +1,261 @@
+package rns
+
+import (
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// SPEC §11 dispatch: the server half (inbound REQUEST -> handler ->
+// RESPONSE) and the initiator half (outbound REQUEST, inbound RESPONSE
+// matched by request_id).
+
+// SendRequest issues a §11.1 REQUEST over an established link and
+// returns a receipt to await the answer on.
+//
+// `data` is the application value itself — nil for a plain GET, a map
+// for a form post, a slice for an LXMF propagation /get round. It is
+// encoded directly into the envelope; do NOT pre-msgpack it (§11.1).
+//
+// The request_id is computed from the OUTBOUND PACKET's hashable part,
+// because that is what the server will hash to label its response
+// (§11.2). The receipt is registered before the packet is broadcast so
+// a fast responder cannot answer into a gap.
+func (t *Transport) SendRequest(linkID []byte, path string, data any) (*RequestReceipt, error) {
+	if path == "" {
+		return nil, errors.New("request path must not be empty")
+	}
+	l := t.linkManager.Get(linkID)
+	if l == nil {
+		return nil, fmt.Errorf("SendRequest: unknown link_id %x", linkID)
+	}
+	l.mu.Lock()
+	state := l.State
+	signing, encryption := l.Signing, l.Encryption
+	l.mu.Unlock()
+	if state != LinkActive {
+		return nil, fmt.Errorf("SendRequest: link is %s, want active", state)
+	}
+
+	packed, err := PackRequest(RequestPathHash(path), data, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	if len(packed) > LinkMDU {
+		// Resource-form REQUESTs (§11.1, > link.mdu) are not implemented
+		// yet: the advertisement must carry request_id in `q` and the
+		// `u` is_request flag, which the Resource sender does not set.
+		return nil, fmt.Errorf("request envelope is %d bytes, over the %d-byte single-packet budget (Resource-form REQUEST not implemented)",
+			len(packed), LinkMDU)
+	}
+
+	pkt, err := BuildLinkDataPacket(linkID, signing, encryption, packed)
+	if err != nil {
+		return nil, err
+	}
+	pkt.Context = ContextRequest
+
+	requestID, err := RequestIDFromPacket(pkt)
+	if err != nil {
+		return nil, err
+	}
+
+	receipt := &RequestReceipt{
+		ID:     requestID,
+		Path:   path,
+		LinkID: append([]byte(nil), linkID...),
+		ch:     make(chan requestResult, 1),
+	}
+	t.requestMu.Lock()
+	if t.pendingRequests == nil {
+		t.pendingRequests = make(map[string]*RequestReceipt)
+	}
+	t.pendingRequests[hex.EncodeToString(requestID)] = receipt
+	t.requestMu.Unlock()
+
+	if err := t.Broadcast(pkt); err != nil {
+		t.cancelPendingRequest(requestID)
+		return nil, err
+	}
+	t.logger.Printf("request %x sent on link %x path %q (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
+	return receipt, nil
+}
+
+// CancelRequest drops a pending receipt without waiting for a response.
+func (t *Transport) CancelRequest(r *RequestReceipt) {
+	if r != nil {
+		t.cancelPendingRequest(r.ID)
+	}
+}
+
+func (t *Transport) cancelPendingRequest(requestID []byte) {
+	t.requestMu.Lock()
+	delete(t.pendingRequests, hex.EncodeToString(requestID))
+	t.requestMu.Unlock()
+}
+
+func (t *Transport) takePendingRequest(requestID []byte) *RequestReceipt {
+	t.requestMu.Lock()
+	defer t.requestMu.Unlock()
+	key := hex.EncodeToString(requestID)
+	r := t.pendingRequests[key]
+	delete(t.pendingRequests, key)
+	return r
+}
+
+// handleRequest processes an inbound §11.1 REQUEST: decrypt, parse,
+// find the handler, apply the §11.4 allow mode, and emit the §11.2
+// RESPONSE labelled with the request_id derived from THIS packet.
+func (t *Transport) handleRequest(p *Packet) {
+	l := t.linkManager.Get(p.DestHash)
+	if l == nil {
+		t.logger.Printf("request: unknown link_id %x", p.DestHash)
+		return
+	}
+	l.mu.Lock()
+	state := l.State
+	signing, encryption := l.Signing, l.Encryption
+	l.mu.Unlock()
+	if state != LinkActive {
+		t.logger.Printf("request on link %x in state %s", p.DestHash[:4], state)
+		return
+	}
+
+	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
+	if err != nil {
+		t.logger.Printf("request decrypt: %v", err)
+		return
+	}
+	ts, pathHash, data, err := ParseRequest(plaintext)
+	if err != nil {
+		t.logger.Printf("request parse: %v", err)
+		return
+	}
+
+	entry := t.lookupRequestHandler(pathHash)
+	if entry == nil {
+		// Upstream drops silently; log so an operator can see a client
+		// asking for a path this node does not serve.
+		t.logger.Printf("request: %v (path_hash %x on link %x)", ErrRequestNoHandler, pathHash[:4], p.DestHash[:4])
+		return
+	}
+
+	remote := l.RemoteIdentity()
+	if !entry.permits(remote) {
+		t.logger.Printf("request %q refused on link %x: %v (allow=%d, identified=%t)",
+			entry.path, p.DestHash[:4], ErrRequestNotAllowed, entry.allow, remote != nil)
+		return
+	}
+
+	requestID, err := RequestIDFromPacket(p)
+	if err != nil {
+		t.logger.Printf("request id: %v", err)
+		return
+	}
+
+	response, err := entry.handler(&RequestContext{
+		Path:           entry.path,
+		PathHash:       pathHash,
+		Data:           data,
+		Timestamp:      ts,
+		LinkID:         append([]byte(nil), p.DestHash...),
+		RemoteIdentity: remote,
+	})
+	if err != nil {
+		// A generator that errors sends nothing, matching upstream's
+		// None return. The initiator's own timeout covers it.
+		t.logger.Printf("request handler %q: %v", entry.path, err)
+		return
+	}
+
+	packed, err := PackResponse(requestID, response)
+	if err != nil {
+		t.logger.Printf("pack response for %q: %v", entry.path, err)
+		return
+	}
+	if len(packed) > LinkMDU {
+		// Resource-form RESPONSEs (§11.2) need the advertisement's `q`
+		// and `p` flags, which the Resource sender does not set yet.
+		// Reception of one is implemented; emission is not.
+		t.logger.Printf("response for %q is %d bytes, over the %d-byte single-packet budget (Resource-form RESPONSE emission not implemented)",
+			entry.path, len(packed), LinkMDU)
+		return
+	}
+
+	respPkt, err := BuildLinkDataPacket(p.DestHash, signing, encryption, packed)
+	if err != nil {
+		t.logger.Printf("build response packet: %v", err)
+		return
+	}
+	respPkt.Context = ContextResponse
+	if err := t.Broadcast(respPkt); err != nil {
+		t.logger.Printf("response broadcast: %v", err)
+		return
+	}
+	t.logger.Printf("request %q answered on link %x (id %x, %d bytes)", entry.path, p.DestHash[:4], requestID[:4], len(packed))
+}
+
+// handleResponse processes an inbound §11.2 RESPONSE and hands it to
+// the receipt that asked for it.
+func (t *Transport) handleResponse(p *Packet) {
+	l := t.linkManager.Get(p.DestHash)
+	if l == nil {
+		t.logger.Printf("response: unknown link_id %x", p.DestHash)
+		return
+	}
+	l.mu.Lock()
+	signing, encryption := l.Signing, l.Encryption
+	l.mu.Unlock()
+
+	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
+	if err != nil {
+		t.logger.Printf("response decrypt: %v", err)
+		return
+	}
+	requestID, response, err := ParseResponse(plaintext)
+	if err != nil {
+		t.logger.Printf("response parse: %v", err)
+		return
+	}
+	t.deliverResponse(requestID, response)
+}
+
+// deliverResponse routes a decoded response to its receipt. Shared by
+// the single-packet path and the Resource-carried one.
+//
+// §11.2 is emphatic that element [0] MUST be checked: without it a
+// misbehaving relay can replay a stale RESPONSE and the initiator
+// accepts it as the answer to whatever is currently pending. Matching
+// on the id is that check — an unmatched response is dropped, never
+// handed to whichever request happens to be in flight.
+func (t *Transport) deliverResponse(requestID []byte, response any) {
+	receipt := t.takePendingRequest(requestID)
+	if receipt == nil {
+		t.logger.Printf("response: %v (id %x)", ErrResponseUnsolicited, requestID[:4])
+		return
+	}
+	receipt.deliver(requestResult{response: response})
+	t.logger.Printf("request %x answered (path %q)", requestID[:4], receipt.Path)
+}
+
+// deliverResourceResponse handles a §11.2 RESPONSE that arrived as a
+// Resource (§10) rather than a single packet — the ordinary case for
+// anything larger than the link MDU, which covers most NomadNet pages
+// and every non-trivial propagation /get round. The advertisement
+// carried the request_id in `q`; the assembled body is the same
+// msgpack([request_id, response]) envelope.
+func (t *Transport) deliverResourceResponse(requestID, body []byte) {
+	innerID, response, err := ParseResponse(body)
+	if err != nil {
+		t.logger.Printf("resource response parse (id %x): %v", requestID[:4], err)
+		return
+	}
+	if !bytesEqual(innerID, requestID) {
+		// The advertisement and the envelope disagree about which
+		// request this answers. Trust neither.
+		t.logger.Printf("resource response id mismatch: adv %x, envelope %x", requestID[:4], innerID[:4])
+		return
+	}
+	t.deliverResponse(requestID, response)
+}

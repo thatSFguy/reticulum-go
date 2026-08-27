@@ -178,6 +178,15 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		linkSigning:        signing,
 		linkEncryption:     encryption,
 		OnAssembled: func(body []byte) {
+			// A Resource carrying a §11.2 RESPONSE is answered by the
+			// request machinery, not handed to the link's data callback:
+			// the body is an RPC envelope, not application payload. The
+			// advertisement labels it with `q` (request_id) and the `p`
+			// is_response flag (§10.4).
+			if len(adv.RequestID) == RequestIDLen && byte(adv.Flags)&ResourceFlagIsResponse != 0 {
+				t.deliverResourceResponse(adv.RequestID, body)
+				return
+			}
 			if cb != nil {
 				cb(body)
 			} else if h := t.linkManager.resourceAssembledHandler(); h != nil {

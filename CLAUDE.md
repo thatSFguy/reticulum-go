@@ -75,6 +75,7 @@ go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
 | Proofs (§6.6) | `rns/proof.go` |
 | Transport, path finding, relayed-packet handling (§7, §12) | `rns/transport.go`, `rns/path.go` |
 | Resource fragmentation (§10) | `rns/resource*.go` |
+| REQUEST/RESPONSE RPC (§11) | `rns/request.go`, `rns/request_dispatch.go` |
 | HDLC framing + TCP interface (§8) | `rns/hdlc.go`, `rns/tcp.go`, `rns/tcp_reconnect.go` |
 | Hostile-msgpack guard | `rns/msgpack_guard.go` (+ fuzz target) |
 | LXMF message pack/unpack, signature (§5.3–§5.6) | `lxmf/message.go` |

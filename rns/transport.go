@@ -38,6 +38,16 @@ type Transport struct {
 	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
 	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
 
+	// SPEC §11 REQUEST/RESPONSE state. requestHandlers is the server
+	// side, keyed by hex(§11.3 path hash); pendingRequests is the
+	// initiator side, keyed by hex(request_id) so an inbound RESPONSE
+	// can be matched to the outbound REQUEST that earned it. Guarded by
+	// their own mutex rather than t.mu: a handler runs application code
+	// and must not hold the lock every announce and packet contends on.
+	requestMu       sync.Mutex
+	requestHandlers map[string]*requestHandlerEntry
+	pendingRequests map[string]*RequestReceipt
+
 	// pinned holds destinations protected from cache eviction, keyed by
 	// hex dest_hash. See PinDestinations.
 	pinned map[string]struct{}
@@ -1086,6 +1096,17 @@ func (t *Transport) handleLinkData(p *Packet) {
 		// usually has at most one inbound resource per link in
 		// flight, so the walk is short.
 		t.handleResourcePart(p)
+		return
+	case ContextRequest:
+		// SPEC §11.1 — an over-Link RPC call. Consumed here: the
+		// handler registry answers it, the application never sees the
+		// raw frame.
+		t.handleRequest(p)
+		return
+	case ContextResponse:
+		// SPEC §11.2 — the answer to one of our outbound requests,
+		// matched to its receipt by request_id.
+		t.handleResponse(p)
 		return
 	case ContextLinkIdentify:
 		// SPEC §6.7.6 — the initiator proving which long-term identity
