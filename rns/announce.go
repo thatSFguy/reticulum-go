@@ -337,16 +337,37 @@ func DecodeLXMFAppDataStampCost(data []byte) (int, error) {
 	if err := safeUnmarshalAnnounce(arr[1], &cost); err != nil {
 		return 0, fmt.Errorf("app_data: stamp_cost is not an integer: %w", err)
 	}
-	// A stamp_cost is a leading-zero-bit target for a SHA-256 digest, so
-	// the satisfiable range is [0, 256]. Outside it the announce is
-	// malformed rather than merely expensive: no stamp can ever clear 300
-	// bits, so passing the number through would hand callers a value that
-	// only looks like a cost. (Found by FuzzDecodeLXMFAppDataStampCost,
-	// which reached 2^61 through a uint64 envelope.) Costs that are
-	// satisfiable but more work than we will do are a separate decision,
-	// made against lxmf.MaxDeliveryStampCost at grind time.
-	if cost < 0 || cost > stampCostBits {
-		return 0, fmt.Errorf("app_data: stamp_cost %d outside the satisfiable range [0, %d]", cost, stampCostBits)
+	// A uint64 envelope holding more than MaxInt64 wraps to a negative
+	// int64 — 0xcf ff..ff arrives as -1 — which the "< 1 means no stamp"
+	// rule below would read as a peer politely asking for nothing,
+	// silently swallowing a malformed announce. The type byte is the only
+	// reliable discriminator: decoding into uint64 instead does not help,
+	// because this library wraps a negative fixint the other way just as
+	// happily. Found by FuzzDecodeLXMFAppDataStampCost.
+	if arr[1][0] == msgpackUint64Code && cost < 0 {
+		return 0, fmt.Errorf("app_data: stamp_cost %d exceeds the %d upstream accepts",
+			uint64(cost), maxAnnouncedStampCost)
+	}
+	// Range per upstream's own setter, LXMRouter.set_inbound_stamp_cost
+	// (LXMF/LXMRouter.py:384-390), which is the only way a conformant peer
+	// arrives at the value it announces (SPEC §4.3):
+	//
+	//	cost < 1    -> stored as None, i.e. no stamp required
+	//	1..254      -> accepted
+	//	cost >= 255 -> REJECTED; the destination keeps its previous cost
+	//
+	// So a negative cost is not malformed — upstream reads it as "no
+	// stamp" — while anything at or above 255 cannot come from a peer
+	// that went through the setter, and is treated as a malformed
+	// announce. (An earlier revision allowed up to 256 on the theory that
+	// a cost is a SHA-256 leading-zero target; that bound is true but
+	// looser than anything upstream will emit.)
+	if cost < 1 {
+		return 0, nil
+	}
+	if cost > maxAnnouncedStampCost {
+		return 0, fmt.Errorf("app_data: stamp_cost %d exceeds the %d upstream accepts",
+			cost, maxAnnouncedStampCost)
 	}
 	return int(cost), nil
 }
@@ -354,9 +375,13 @@ func DecodeLXMFAppDataStampCost(data []byte) (int, error) {
 // msgpackNilByte is the msgpack format byte for nil.
 const msgpackNilByte = 0xc0
 
-// stampCostBits is the widest meaningful stamp_cost: a cost counts
-// leading zero bits of a SHA-256 digest, which has 256 of them.
-const stampCostBits = 256
+// msgpackUint64Code is the msgpack type byte for a uint64 envelope.
+const msgpackUint64Code = 0xcf
+
+// maxAnnouncedStampCost is the largest stamp_cost a conformant peer can
+// announce: upstream's set_inbound_stamp_cost refuses anything >= 255
+// (LXMF/LXMRouter.py:387-389), so the accepted range is 1..254.
+const maxAnnouncedStampCost = 254
 
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {
