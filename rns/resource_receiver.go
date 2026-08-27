@@ -76,6 +76,7 @@ type ResourceReceiver struct {
 	// Indexed by hashmap position (0-based).
 	parts         [][]byte
 	receivedCount int
+	receivedBytes int    // running total of placed part lengths
 	receivedFlags []bool // parts[i] arrived?
 
 	// Channels: dispatcher → receiver goroutine.
@@ -102,7 +103,7 @@ type ResourceReceiver struct {
 	// transfer where two distant parts collide on their 4-byte hash.
 	consecutiveHeight int
 
-	mu sync.Mutex // guards parts / receivedFlags / receivedCount / pendingTarget / consecutiveHeight
+	mu sync.Mutex // guards parts / receivedFlags / receivedCount / receivedBytes / pendingTarget / consecutiveHeight
 
 	// OnAssembled is called from the receiver goroutine with the
 	// fully-assembled, decrypted, prefix-stripped body. Wired by the
@@ -397,6 +398,16 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 // (a map_hash matching no slot at all).
 var errResourceDuplicatePart = errors.New("resource receiver: duplicate part (retransmit)")
 
+// errResourcePartOversize and errResourceOverAdvertisedSize mark the two
+// ways an inbound part can exceed what the advertisement bought. Both
+// are receive-path allocation limits (SPEC §16.8 / §10.4 callout): the
+// ADV bounds a transfer's size and part count before a receiver opens,
+// and these bound each part and their running total once it has.
+var (
+	errResourcePartOversize       = errors.New("resource receiver: part exceeds one SDU")
+	errResourceOverAdvertisedSize = errors.New("resource receiver: parts exceed the advertised transfer size")
+)
+
 // placePart locates the part's hashmap slot via map_hash and drops it
 // in. Returns nil when the part filled a new slot, errResourceDuplicatePart
 // when it matched an already-received slot, or a plain error when its
@@ -412,6 +423,16 @@ var errResourceDuplicatePart = errors.New("resource receiver: duplicate part (re
 // receiver only requests parts within ~WindowMax of the frontier and
 // the sender serves from the same bounded range.
 func (rr *ResourceReceiver) placePart(part []byte) error {
+	// A legitimate part is one SDU-sized slice of the encrypted body
+	// (SPEC §10.2 step 6), so anything larger is malformed or hostile.
+	// Rejecting it here, before it is buffered, keeps the parts table
+	// within the budget the ADV bought: ParseResourceAdv caps the part
+	// COUNT, and this caps each part's SIZE, so the two together bound
+	// what one transfer can hold.
+	if len(part) > ResourceSDU {
+		return fmt.Errorf("%w: %d > %d bytes", errResourcePartOversize, len(part), ResourceSDU)
+	}
+
 	mh := ResourceMapHash(part, rr.randomR)
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
@@ -433,9 +454,19 @@ func (rr *ResourceReceiver) placePart(part []byte) error {
 			dup = true
 			continue
 		}
+		// Never accumulate past what the advertisement promised.
+		// assemble() already rejects a transfer whose total does not
+		// match, but only after every part is buffered — a sender that
+		// keeps feeding parts that each fit the hashmap window would
+		// otherwise be paid for in memory first and rejected second.
+		if rr.expectedSize > 0 && rr.receivedBytes+len(part) > rr.expectedSize {
+			return fmt.Errorf("%w: %d + %d > advertised %d bytes",
+				errResourceOverAdvertisedSize, rr.receivedBytes, len(part), rr.expectedSize)
+		}
 		rr.parts[i] = part
 		rr.receivedFlags[i] = true
 		rr.receivedCount++
+		rr.receivedBytes += len(part)
 		// Advance the consecutive-completed frontier as far as the
 		// contiguous run of received parts now reaches.
 		for rr.consecutiveHeight+1 < len(rr.parts) && rr.receivedFlags[rr.consecutiveHeight+1] {
