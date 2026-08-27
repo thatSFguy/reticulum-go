@@ -62,6 +62,69 @@ func ParseLinkDataPacket(p *Packet, signing, encryption []byte) ([]byte, error) 
 	return LinkTokenDecrypt(p.Data, signing, encryption)
 }
 
+// LINKIDENTIFY (SPEC §6.7.6, context = 0xFB).
+//
+// The initiator proves which long-term identity is driving an already
+// established Link, without re-running the handshake. The body is
+//
+//	public_key(64) || signature(64)
+//
+// where public_key is the full announced key (X25519 pub || Ed25519 pub,
+// §1.1) and signature is over link_id(16) || public_key(64) — NOT over
+// link_id alone, which §6.7.6 calls out explicitly as the mistake that
+// makes every allow-listed request fail.
+const (
+	// LinkIdentifySigLen is the Ed25519 signature half of the body.
+	LinkIdentifySigLen = 64
+	// LinkIdentifyBodyLen is the whole decrypted §6.7.6 body.
+	LinkIdentifyBodyLen = PublicKeyLen + LinkIdentifySigLen
+)
+
+// ParseLinkIdentifyPacket decrypts a §6.7.6 LINKIDENTIFY packet and
+// splits its body.
+//
+// The packet is ordinary link DATA as far as the wire is concerned —
+// §6.7.6 notes that context 0xFB is NOT in upstream Packet.pack()'s
+// not-encrypted set, unlike KEEPALIVE (§6.7.1) or link PROOF (§6.5) —
+// so it decrypts with the same link-derived Token form as any other
+// link DATA.
+func ParseLinkIdentifyPacket(p *Packet, signing, encryption []byte) (pubKey, signature []byte, err error) {
+	if p == nil {
+		return nil, nil, errors.New("nil packet")
+	}
+	if p.PacketType != PacketData {
+		return nil, nil, fmt.Errorf("packet_type %d is not DATA", p.PacketType)
+	}
+	if p.DestinationType != DestinationLink {
+		return nil, nil, fmt.Errorf("dest_type %d is not LINK", p.DestinationType)
+	}
+	if p.Context != ContextLinkIdentify {
+		return nil, nil, fmt.Errorf("context = 0x%02x, want 0x%02x", p.Context, ContextLinkIdentify)
+	}
+	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(plaintext) != LinkIdentifyBodyLen {
+		return nil, nil, fmt.Errorf("LINKIDENTIFY body is %d bytes, want %d", len(plaintext), LinkIdentifyBodyLen)
+	}
+	return plaintext[:PublicKeyLen], plaintext[PublicKeyLen:], nil
+}
+
+// VerifyLinkIdentify checks a §6.7.6 signature: Ed25519 over
+// link_id || public_key, against the Ed25519 half of public_key.
+func VerifyLinkIdentify(linkID, pubKey, signature []byte) bool {
+	if len(linkID) != IdentityHashLen || len(pubKey) != PublicKeyLen || len(signature) != LinkIdentifySigLen {
+		return false
+	}
+	signed := make([]byte, 0, len(linkID)+len(pubKey))
+	signed = append(signed, linkID...)
+	signed = append(signed, pubKey...)
+	// X25519 pub occupies the first 32 bytes; the Ed25519 verification
+	// key is the second half (§1.1).
+	return Validate(pubKey[PublicKeyLen/2:], signed, signature)
+}
+
 // BuildLinkProof builds the explicit-form (96-byte) PROOF packet that
 // acknowledges receipt of an inbound link DATA packet (SPEC §6.5.6).
 // Per upstream RNS 1.2.0 link DATA proofs are ALWAYS explicit

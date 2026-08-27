@@ -1008,6 +1008,23 @@ func (t *Transport) sendLRRTT(linkID []byte, link *Link, rttSec float64) error {
 	return t.Broadcast(pkt)
 }
 
+// handleLinkIdentify processes an inbound §6.7.6 LINKIDENTIFY and, on
+// success, records the peer's public key on the link and notifies the
+// application. Failures are logged and dropped: upstream simply leaves
+// remote_identity unset, and the link stays usable either way.
+func (t *Transport) handleLinkIdentify(p *Packet) {
+	link, pubKey, err := t.linkManager.HandleLinkIdentify(p)
+	if err != nil {
+		t.logger.Printf("link identify: %v", err)
+		return
+	}
+	idHash := IdentityHashFromPublicKey(pubKey)
+	t.logger.Printf("link %x identified as %x (SPEC §6.7.6, verified)", link.ID[:4], idHash)
+	if h := t.linkManager.remoteIdentifiedHandler(); h != nil {
+		h(append([]byte(nil), link.ID...), append([]byte(nil), pubKey...))
+	}
+}
+
 // handleLinkData processes inbound DATA packets addressed to a link_id.
 // Decrypts via the LinkManager, emits the SPEC §6.5.6 explicit-form
 // PROOF acknowledging the packet, then forwards plaintext to the link's
@@ -1069,6 +1086,13 @@ func (t *Transport) handleLinkData(p *Packet) {
 		// usually has at most one inbound resource per link in
 		// flight, so the walk is short.
 		t.handleResourcePart(p)
+		return
+	case ContextLinkIdentify:
+		// SPEC §6.7.6 — the initiator proving which long-term identity
+		// drives this link. Consumed here, exactly as upstream consumes
+		// it inside Link.receive() rather than surfacing the raw frame
+		// to the application.
+		t.handleLinkIdentify(p)
 		return
 	default:
 		// Other contexts (REQUEST/RESPONSE/etc) — out of scope for fwdsvc.

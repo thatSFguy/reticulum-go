@@ -96,6 +96,13 @@ type Link struct {
 	// the responder signs to ack our outbound DATA.
 	peerEd25519Pub []byte
 
+	// remoteIdentity is the peer's 64-byte announced public key, proved
+	// over a §6.7.6 LINKIDENTIFY. Responder-side only, and set at most
+	// once for the life of the link: upstream assigns it only when it is
+	// still None (RNS/Link.py:970-989), so a peer cannot re-identify as
+	// somebody else mid-link.
+	remoteIdentity []byte
+
 	// pendingProofs maps hex(packet_hash) → channel that SendOverLink
 	// blocks on. handleLinkProof closes the channel (with nil) on
 	// successful proof verification, or sends an error on bad-sig.
@@ -149,6 +156,18 @@ func (l *Link) MarkAuthenticated() {
 	l.mu.Lock()
 	l.authenticated = true
 	l.mu.Unlock()
+}
+
+// RemoteIdentity returns the peer's 64-byte public key if they have
+// identified over §6.7.6, or nil. Mirrors upstream's
+// Link.get_remote_identity().
+func (l *Link) RemoteIdentity() []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.remoteIdentity == nil {
+		return nil
+	}
+	return append([]byte(nil), l.remoteIdentity...)
 }
 
 // IsInitiator returns true when this Link was opened locally (we sent
@@ -286,6 +305,10 @@ type LinkManager struct {
 	// the per-link handler and falls back to this one, which carries the
 	// link_id so an application can route the body to the right session.
 	defaultOnResourceAssembled func(linkID, body []byte)
+
+	// defaultOnRemoteIdentified fires when a peer completes a §6.7.6
+	// LINKIDENTIFY on a link we responded to.
+	defaultOnRemoteIdentified func(linkID, pubKey []byte)
 
 	// senders / receivers index in-flight Resource transfers per link
 	// keyed by hex(link_id) || hex(resource_hash) so the Transport
@@ -456,6 +479,75 @@ func (lm *LinkManager) resourceAssembledHandler() func(linkID, body []byte) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	return lm.defaultOnResourceAssembled
+}
+
+// SetRemoteIdentifiedHandler registers a callback fired when a peer
+// proves its identity over §6.7.6 on a responder-side link. The callback
+// receives the link_id and the peer's 64-byte announced public key.
+func (lm *LinkManager) SetRemoteIdentifiedHandler(cb func(linkID, pubKey []byte)) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lm.defaultOnRemoteIdentified = cb
+}
+
+func (lm *LinkManager) remoteIdentifiedHandler() func(linkID, pubKey []byte) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.defaultOnRemoteIdentified
+}
+
+// HandleLinkIdentify processes an inbound §6.7.6 LINKIDENTIFY.
+//
+// Upstream semantics (RNS/Link.py:970-989), mirrored deliberately:
+//
+//   - responder side only. Upstream guards on `not self.initiator`; an
+//     initiator receiving one ignores it.
+//   - the body must be exactly public_key(64) || signature(64).
+//   - the signature is verified over link_id || public_key.
+//   - remote_identity is assigned only if not already set.
+//
+// A failure at any step is not an error the caller should act on —
+// upstream simply does not assign remote_identity — so this returns the
+// reason for logging and leaves the link usable.
+func (lm *LinkManager) HandleLinkIdentify(p *Packet) (*Link, []byte, error) {
+	if p == nil {
+		return nil, nil, errors.New("nil packet")
+	}
+	l := lm.Get(p.DestHash)
+	if l == nil {
+		return nil, nil, fmt.Errorf("LINKIDENTIFY for unknown link_id %x", p.DestHash)
+	}
+	if l.IsInitiator() {
+		return l, nil, errors.New("LINKIDENTIFY received on an initiator-side link; ignored")
+	}
+	l.mu.Lock()
+	if l.State != LinkActive {
+		l.mu.Unlock()
+		return l, nil, fmt.Errorf("LINKIDENTIFY on link in state %s", l.State)
+	}
+	signing, encryption := l.Signing, l.Encryption
+	already := l.remoteIdentity != nil
+	linkID := append([]byte(nil), l.ID...)
+	l.LastActivity = time.Now()
+	l.mu.Unlock()
+
+	pubKey, sig, err := ParseLinkIdentifyPacket(p, signing, encryption)
+	if err != nil {
+		return l, nil, err
+	}
+	if !VerifyLinkIdentify(linkID, pubKey, sig) {
+		return l, nil, errors.New("LINKIDENTIFY signature invalid")
+	}
+	if already {
+		// Upstream assigns only while remote_identity is None. Re-identify
+		// attempts are dropped rather than allowed to rebind the link.
+		return l, nil, errors.New("LINKIDENTIFY ignored; link already identified")
+	}
+
+	l.mu.Lock()
+	l.remoteIdentity = append([]byte(nil), pubKey...)
+	l.mu.Unlock()
+	return l, pubKey, nil
 }
 
 // Get returns the Link with the given link_id, or nil if unknown.
