@@ -187,6 +187,11 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 				t.deliverResourceResponse(adv.RequestID, body)
 				return
 			}
+			// The mirror case: a REQUEST too large for one packet (`u`).
+			if len(adv.RequestID) == RequestIDLen && byte(adv.Flags)&ResourceFlagIsRequest != 0 {
+				t.serveResourceRequest(link, adv.RequestID, body)
+				return
+			}
 			if cb != nil {
 				cb(body)
 			} else if h := t.linkManager.resourceAssembledHandler(); h != nil {

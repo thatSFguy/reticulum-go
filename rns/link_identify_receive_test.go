@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -204,5 +206,66 @@ func TestLinkIdentifyRejectsWrongBodyLength(t *testing.T) {
 	short.Context = ContextLinkIdentify
 	if _, _, err := bobMgr.HandleLinkIdentify(short); err == nil {
 		t.Error("accepted a LINKIDENTIFY whose body is the wrong length")
+	}
+}
+
+// TestLinkIdentifyAssignOnceUnderConcurrency exercises the assign-once
+// rule from several goroutines at once. Two valid identifications
+// racing must leave exactly one winner: the invariant is what stops a
+// peer re-identifying as somebody else mid-link, and it must hold in
+// this function rather than depending on the Transport happening to
+// dispatch on a single goroutine.
+func TestLinkIdentifyAssignOnceUnderConcurrency(t *testing.T) {
+	const racers = 8
+	_, aliceLink, bobMgr, bobLink, _ := activeLinkPair(t)
+
+	// Every racer presents a DIFFERENT valid identity, so a lost race
+	// is visible as a changed binding rather than an idempotent rewrite.
+	pkts := make([]*Packet, 0, racers)
+	pubs := make([][]byte, 0, racers)
+	for i := 0; i < racers; i++ {
+		id, err := NewIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkt, err := BuildLinkIdentify(aliceLink.ID, aliceLink.Signing, aliceLink.Encryption, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pkts = append(pkts, pkt)
+		pubs = append(pubs, id.PublicKey())
+	}
+
+	var wg sync.WaitGroup
+	var wins atomic.Int32
+	start := make(chan struct{})
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(pkt *Packet) {
+			defer wg.Done()
+			<-start
+			if _, pub, err := bobMgr.HandleLinkIdentify(pkt); err == nil && pub != nil {
+				wins.Add(1)
+			}
+		}(pkts[i])
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Errorf("%d identifications were accepted, want exactly 1", got)
+	}
+	bound := bobLink.RemoteIdentity()
+	if bound == nil {
+		t.Fatal("no identity bound after the race")
+	}
+	matches := 0
+	for _, p := range pubs {
+		if bytes.Equal(bound, p) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Errorf("bound identity matches %d of the racers, want exactly 1", matches)
 	}
 }

@@ -339,3 +339,52 @@ func TestRetrieveDecodesFlatBodyList(t *testing.T) {
 		t.Error("the [timestamp, [bodies]] upload shape was accepted as a body list")
 	}
 }
+
+// A §11 REQUEST too large for one packet rides a Resource (§11.1). The
+// id derivation differs by form — a Resource has no packet to hash, so
+// it hashes the envelope and carries the id in the advertisement's `q`
+// — and getting that wrong means the server labels its answer with an
+// id the initiator never registered, so every large request times out.
+//
+// Driven through the propagation fixture because it already has a real
+// link, a real handler, and a real Transport on each side.
+func TestLargeRequestRidesAResource(t *testing.T) {
+	f := newRetrieveFixture(t, 0)
+
+	// A /get whose `haves` list alone exceeds the 431-byte link MDU.
+	var haves []any
+	for i := 0; i < 40; i++ {
+		haves = append(haves, bytes.Repeat([]byte{byte(i)}, 32))
+	}
+
+	link, err := f.tA.AcquireLink(f.nodeDest, 5*time.Second)
+	if err != nil {
+		t.Fatalf("AcquireLink: %v", err)
+	}
+	if err := f.tA.IdentifyOnLink(link.ID, f.alice); err != nil {
+		t.Fatalf("IdentifyOnLink: %v", err)
+	}
+
+	receipt, err := f.tA.SendRequest(link.ID, MessageGetPath, []any{nil, haves})
+	if err != nil {
+		t.Fatalf("SendRequest: %v", err)
+	}
+	if _, err := receipt.Response(5 * time.Second); err != nil {
+		t.Fatalf("large request never answered: %v", err)
+	}
+
+	// The node must have seen the full purge list, not a truncated one.
+	f.node.mu.Lock()
+	defer f.node.mu.Unlock()
+	if len(f.node.rounds) == 0 {
+		t.Fatal("the node saw no request at all")
+	}
+	last := f.node.rounds[len(f.node.rounds)-1]
+	got, ok := last[1].([]any)
+	if !ok {
+		t.Fatalf("haves element is %T, want a list", last[1])
+	}
+	if len(got) != len(haves) {
+		t.Errorf("node received %d haves, want %d — the envelope was truncated", len(got), len(haves))
+	}
+}
