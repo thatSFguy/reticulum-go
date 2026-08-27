@@ -315,6 +315,12 @@ func TestDecodeLXMFAppDataStampCost(t *testing.T) {
 		// 3-element array: [name, stamp_cost, capability_flags]. The
 		// cost is still element [1].
 		{"3-element array", []byte{0x93, 0xc4, 0x01, 'n', 0x0c, 0x00}, 12},
+		// Upstream's setter maps anything < 1 to None — a negative cost
+		// means "no stamp required", not a malformed announce
+		// (LXMF/LXMRouter.py:385-386).
+		{"negative means no stamp", []byte{0x92, 0xc4, 0x01, 'n', 0xff}, 0},
+		// 254 is the largest value set_inbound_stamp_cost accepts.
+		{"upper bound accepted", []byte{0x92, 0xc4, 0x01, 'n', 0xcc, 0xfe}, 254},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := DecodeLXMFAppDataStampCost(c.in)
@@ -339,8 +345,11 @@ func TestDecodeLXMFAppDataStampCostRejectsGarbage(t *testing.T) {
 	}{
 		// [bin "n", str "high"] — element [1] is text, not an integer.
 		{"stamp_cost is a string", []byte{0x92, 0xc4, 0x01, 'n', 0xa4, 'h', 'i', 'g', 'h'}},
-		// [bin "n", -1] — negative fixint.
-		{"negative stamp_cost", []byte{0x92, 0xc4, 0x01, 'n', 0xff}},
+		// 255 is where upstream's setter returns False, so no conformant
+		// peer announces it (LXMF/LXMRouter.py:387-389).
+		{"stamp_cost at the upstream refusal point", []byte{0x92, 0xc4, 0x01, 'n', 0xcc, 0xff}},
+		// uint64 max, reached by the fuzzer through a uint64 envelope.
+		{"absurd stamp_cost", []byte{0x92, 0xc4, 0x01, 'n', 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got, err := DecodeLXMFAppDataStampCost(c.in)
@@ -380,12 +389,12 @@ func FuzzDecodeLXMFAppDataStampCost(f *testing.F) {
 			}
 			return
 		}
-		// An accepted cost is a leading-zero-bit target for SHA-256, so
-		// it cannot be negative and cannot exceed the digest width. A
-		// value outside that range means a decode path produced a number
-		// the grind loop would treat as work it can never finish.
-		if got < 0 || got > 256 {
-			t.Errorf("accepted implausible stamp_cost %d", got)
+		// An accepted cost must be one a conformant peer could have
+		// announced: upstream's set_inbound_stamp_cost stores only 1..254,
+		// mapping anything below to None. Outside that, a decode path
+		// produced a number no peer can legitimately be asking for.
+		if got < 0 || got > maxAnnouncedStampCost {
+			t.Errorf("accepted stamp_cost %d, outside the announceable range [0, %d]", got, maxAnnouncedStampCost)
 		}
 	})
 }
