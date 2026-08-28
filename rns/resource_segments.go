@@ -278,6 +278,32 @@ func (s *segmentAssembler) expireLocked(now time.Time) {
 	}
 }
 
+// dropLink releases every partial assembly held for a link.
+//
+// Retention is bounded by time as well, but a torn-down link's segments
+// can never make progress — the transfer is keyed on the link_id and
+// §10.11 has no resumption across links — so holding them to the idle
+// deadline is pure waste of a budget that other links need. It matters
+// more than it looks because exhaustion REFUSES rather than evicts
+// (MaxRetainedSegmentBytes): a peer that opens a link, ships most of a
+// multi-segment transfer, closes, and repeats would otherwise park
+// MaxRetainedSegmentBytes' worth of dead assemblies under distinct
+// link_ids — each one immune to the per-link cap, and each one denying
+// honest transfers on live links for ten minutes at a time.
+func (s *segmentAssembler) dropLink(linkID []byte) {
+	linkHex := hex.EncodeToString(linkID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.perLink[linkHex] == 0 {
+		return
+	}
+	for k, a := range s.all {
+		if a.linkHex == linkHex {
+			s.removeLocked(k, a)
+		}
+	}
+}
+
 // pending reports how many partial transfers are held, for tests and
 // observability.
 func (s *segmentAssembler) pending() int {

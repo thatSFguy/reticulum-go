@@ -319,6 +319,13 @@ type LinkManager struct {
 	// remains race-free.
 	senders   map[string]*ResourceSender
 	receivers map[string]*ResourceReceiver
+
+	// onLinkTornDown, when set, fires with the link_id after every
+	// teardown that removes a link from the table, so state a link
+	// owns OUTSIDE this manager can be released at the same moment.
+	// Transport wires it to the §10.11 segment assembler. Set once at
+	// construction, before the manager is shared.
+	onLinkTornDown func(linkID []byte)
 }
 
 // NewLinkManager constructs an empty manager.
@@ -430,6 +437,7 @@ func (lm *LinkManager) closeResourcesForLink(linkID []byte) {
 	var senders []*ResourceSender
 	var receivers []*ResourceReceiver
 	lm.mu.Lock()
+	hook := lm.onLinkTornDown
 	for k, rs := range lm.senders {
 		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
 			senders = append(senders, rs)
@@ -451,6 +459,9 @@ func (lm *LinkManager) closeResourcesForLink(linkID []byte) {
 	}
 	for _, rr := range receivers {
 		rr.HandleCancel()
+	}
+	if hook != nil {
+		hook(linkID)
 	}
 }
 
@@ -811,13 +822,21 @@ func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identi
 			return existing, saved, nil
 		}
 	}
-	if err := lm.makeRoomForResponderLocked(); err != nil {
+	evicted, err := lm.makeRoomForResponderLocked()
+	if err != nil {
 		lm.mu.Unlock()
 		return nil, nil, err
 	}
 	l.lrProof = proofPkt
 	lm.links[key] = l
 	lm.mu.Unlock()
+	if evicted != "" {
+		// closeResourcesForLink takes lm.mu itself; call it after we
+		// release ours, matching CloseLink's ordering.
+		if evictedID, decErr := hex.DecodeString(evicted); decErr == nil {
+			lm.closeResourcesForLink(evictedID)
+		}
+	}
 	return l, proofPkt, nil
 }
 
@@ -843,7 +862,8 @@ var ErrTooManyLinks = errors.New("link table full; refusing inbound link request
 // recent. The budget deliberately covers responder links ONLY, leaving
 // MaxConcurrentLinks-MaxResponderLinks headroom that a flood can never
 // consume, so our own outbound delivery links always have room.
-func (lm *LinkManager) makeRoomForResponderLocked() error {
+// Returns the hex key of the link it evicted, or "" if none was needed.
+func (lm *LinkManager) makeRoomForResponderLocked() (string, error) {
 	var (
 		responders int
 		oldestKey  string
@@ -863,13 +883,19 @@ func (lm *LinkManager) makeRoomForResponderLocked() error {
 		}
 	}
 	if responders < MaxResponderLinks {
-		return nil
+		return "", nil
 	}
 	if oldestKey == "" {
-		return ErrTooManyLinks
+		return "", ErrTooManyLinks
 	}
 	delete(lm.links, oldestKey)
-	return nil
+	// The caller releases the evicted link's resource transfers once it
+	// has dropped lm.mu. Evicting the table entry alone would strand
+	// every in-flight sender/receiver goroutine on a link that can
+	// never carry another packet, and leave its retained §10.11
+	// segments held to the idle deadline — exactly the flood this
+	// eviction exists to survive.
+	return oldestKey, nil
 }
 
 // HandleLinkData processes an inbound link DATA packet — verifies the
