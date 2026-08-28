@@ -80,9 +80,20 @@ func (d *Delivery) validateInboundStamp(m *Message) bool {
 		return true
 	}
 
-	// Bounded: see MaxConcurrentStampValidations. A message that cannot
-	// get a slot is delivered unchecked rather than delayed, because
-	// blocking here blocks the inbound dispatcher.
+	// Bounded: see MaxConcurrentStampValidations. Blocking here would
+	// block the inbound dispatcher, so a message that cannot get a slot
+	// is delivered unchecked rather than delayed.
+	//
+	// KNOWN TRADEOFF, deliberate — see TestStampValidationIsBounded,
+	// which asserts it. Shedding is fail-OPEN, so under EnforceStamps a
+	// sender who saturates the slots walks unstamped messages past the
+	// control. Saturating is cheap for them and expensive for us (each
+	// validation costs a 768 KiB workblock), so this is a real if
+	// narrow bypass. It is kept because the alternatives are worse:
+	// blocking stalls the dispatcher, and dropping hands an attacker a
+	// way to make US discard honest senders' messages. Revisit only
+	// with a per-sender slot budget, which would bound the flood
+	// instead of choosing which way to fail.
 	select {
 	case stampValidationSlots <- struct{}{}:
 		defer func() { <-stampValidationSlots }()

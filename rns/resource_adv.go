@@ -92,7 +92,7 @@ func PackResourceAdv(adv *ResourceAdvertisement) ([]byte, error) {
 	}
 	wire := *adv
 	wire.Hashmap = adv.Hashmap[:seg0Parts*ResourceMapHashLen]
-	return msgpack.Marshal(&wire)
+	return canonicalMarshal(&wire)
 }
 
 // ParseResourceAdv decodes an inbound RESOURCE_ADV body and applies

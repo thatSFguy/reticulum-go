@@ -611,6 +611,24 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 		d.errorf("link LXMF verify: %w", err)
 		return
 	}
+	// Identical to the opportunistic path, and for the same reasons
+	// (SPEC §5.7.3, §5.7.4): both run only after the signature checks
+	// out, because validating a stamp on an unauthenticated body spends
+	// a 768 KiB workblock on whatever a stranger sent, and remembering
+	// a ticket from one lets anybody grant themselves free delivery in
+	// our name.
+	//
+	// These were missing here until v0.6.1, which made InboundStampCost,
+	// EnforceStamps and Tickets apply to single-packet messages only —
+	// so a sender bypassed stamp enforcement entirely just by opening a
+	// Link, which Send does automatically for anything over
+	// MaxOpportunisticPayload. Enforcement that a 296-byte message walks
+	// straight past is not enforcement.
+	d.rememberInboundTicket(msg)
+	if !d.validateInboundStamp(msg) {
+		return
+	}
+
 	d.dispatchInbound(msg)
 }
 

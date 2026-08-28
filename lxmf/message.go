@@ -349,7 +349,9 @@ func appendStamp(payload, stamp []byte) ([]byte, error) {
 	if len(payload) == 0 || payload[0] != 0x94 {
 		return nil, errors.New("payload is not a 4-element msgpack fixarray")
 	}
-	encoded, err := msgpack.Marshal(stamp)
+	// Canonical: this becomes payload element [4], and the whole
+	// payload is what a §5.7.1 recipient re-packs (SPEC §5.6.1).
+	encoded, err := canonicalMarshal(stamp)
 	if err != nil {
 		return nil, fmt.Errorf("marshal stamp: %w", err)
 	}
@@ -383,7 +385,13 @@ func buildSignedPayload(senderID *rns.Identity, senderDestHash, destHash []byte,
 	}
 
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
-	payload, err = msgpack.Marshal([]any{tsSeconds, title, content, fields})
+	// MUST be canonical. `fields` routinely arrives from a decoded
+	// inbound message, whose integer keys and values are int8/uint8/
+	// int64 rather than int — and a stamp-requiring recipient re-packs
+	// these four elements with umsgpack before verifying our signature
+	// (SPEC §5.6.1, §5.7.1). Non-canonical bytes here are dropped by
+	// every stamped recipient. See lxmf/msgpack_canonical.go.
+	payload, err = canonicalMarshal([]any{tsSeconds, title, content, fields})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("marshal payload: %w", err)
 	}
@@ -493,7 +501,9 @@ func CheckOpportunisticSize(title, content []byte, fields map[any]any) error {
 	if fields == nil {
 		fields = map[any]any{}
 	}
-	payload, err := msgpack.Marshal([]any{0.0, title, content, fields})
+	// Same encoder as buildSignedPayload, or this predicts a size the
+	// real pack will not produce.
+	payload, err := canonicalMarshal([]any{0.0, title, content, fields})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
