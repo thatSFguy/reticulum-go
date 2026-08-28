@@ -83,7 +83,10 @@ func PackRequest(pathHash []byte, data any, ts time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("request_path_hash must be %d bytes, got %d", RequestIDLen, len(pathHash))
 	}
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
-	packed, err := msgpack.Marshal([]any{tsSeconds, pathHash, data})
+	// `data` is caller-supplied `any` (SPEC §11.1 element [2]) and may
+	// well be a decoded inbound value, so this is the one site in this
+	// package with a live path to non-canonical integers.
+	packed, err := canonicalMarshal([]any{tsSeconds, pathHash, data})
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -131,7 +134,8 @@ func PackResponse(requestID []byte, response any) ([]byte, error) {
 	if len(requestID) != RequestIDLen {
 		return nil, fmt.Errorf("request_id must be %d bytes, got %d", RequestIDLen, len(requestID))
 	}
-	packed, err := msgpack.Marshal([]any{requestID, response})
+	// `response` is application-supplied; same reasoning as PackRequest.
+	packed, err := canonicalMarshal([]any{requestID, response})
 	if err != nil {
 		return nil, fmt.Errorf("marshal response: %w", err)
 	}

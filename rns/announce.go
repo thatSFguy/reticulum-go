@@ -269,7 +269,11 @@ func EncodeLXMFAppData(displayName []byte, stampCost *int) ([]byte, error) {
 	}
 	// The slice element type must be `any` so the encoder picks per-element
 	// types instead of an array-typed homogeneous encoding.
-	return msgpack.Marshal([]any{displayName, stampField})
+	// app_data is covered by the §4.2 announce signature we produce,
+	// so canonical encoding is not load-bearing here — stampCost is a
+	// Go *int and already encodes compactly. Kept uniform with every
+	// other emit site; see rns/msgpack_canonical.go.
+	return canonicalMarshal([]any{displayName, stampField})
 }
 
 // DecodeLXMFAppDataDisplayName extracts the display_name from an LXMF

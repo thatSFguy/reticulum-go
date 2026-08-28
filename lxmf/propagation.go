@@ -202,7 +202,10 @@ func PackPropagationBundle(ts time.Time, lxmfData ...[]byte) ([]byte, error) {
 		bodies[i] = d
 	}
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
-	out, err := msgpack.Marshal([]any{tsSeconds, bodies})
+	// No integers in this envelope today, so canonical is a no-op on
+	// the bytes; used anyway so the whole outbound msgpack surface has
+	// one encoder (SPEC §5.6.1).
+	out, err := canonicalMarshal([]any{tsSeconds, bodies})
 	if err != nil {
 		return nil, fmt.Errorf("marshal propagation bundle: %w", err)
 	}

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/bits"
 
-	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -91,7 +90,12 @@ var ErrStampCostTooHigh = errors.New("stamp cost exceeds local limit")
 func stampWorkblock(material []byte, rounds int) ([]byte, error) {
 	out := make([]byte, 0, rounds*workblockRoundLen)
 	for n := 0; n < rounds; n++ {
-		packedN, err := msgpack.Marshal(n)
+		// Hash input: the salt must match upstream's
+		// SHA256(material || umsgpack.packb(n)) exactly or every stamp
+		// we generate and validate is wrong (SPEC §5.7.2). A Go `int`
+		// already encodes compactly, so this is unchanged bytes — made
+		// explicit so it stays that way.
+		packedN, err := canonicalMarshal(n)
 		if err != nil {
 			return nil, fmt.Errorf("marshal round counter: %w", err)
 		}

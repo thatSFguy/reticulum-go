@@ -148,7 +148,7 @@ func BuildResourceHmu(h *ResourceHmu) ([]byte, error) {
 		return nil, fmt.Errorf("resource hmu: hashmap_bytes %d not positive multiple of %d",
 			len(h.HashmapBytes), ResourceMapHashLen)
 	}
-	tail, err := msgpack.Marshal([]any{h.SegmentIndex, h.HashmapBytes})
+	tail, err := canonicalMarshal([]any{h.SegmentIndex, h.HashmapBytes})
 	if err != nil {
 		return nil, fmt.Errorf("resource hmu: msgpack: %w", err)
 	}
