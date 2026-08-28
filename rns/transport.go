@@ -52,6 +52,14 @@ type Transport struct {
 	// arrive as independent Resource transfers.
 	segments *segmentAssembler
 
+	// maxResourceSegments is the per-Transport ceiling on a §10.11
+	// multi-segment transfer's `l`, applied both to what we accept and
+	// to what we emit. Set via SetMaxResourceSegments; 0 means the
+	// DefaultMaxResourceSegments default, and 1 refuses multi-segment
+	// entirely. Never exceeds the MaxAcceptedResourceSegments hard
+	// ceiling that ParseResourceAdv enforces underneath it.
+	maxResourceSegments int
+
 	// channels holds the §6.8 Channel per link, keyed by hex(link_id).
 	channelMu sync.Mutex
 	channels  map[string]*Channel
@@ -260,6 +268,7 @@ func NewTransport(logger Logger) *Transport {
 		pathResponseTagsSeen: map[string]time.Time{},
 		linkManager:          NewLinkManager(),
 		segments:             newSegmentAssembler(),
+		maxResourceSegments:  DefaultMaxResourceSegments,
 		logger:               logger,
 		rlog:                 newRateLimitedLogger(logger),
 	}
@@ -1016,6 +1025,63 @@ func (t *Transport) SetInitiatorIdentity(id *Identity) {
 	t.mu.Lock()
 	t.initiatorIdentity = id
 	t.mu.Unlock()
+}
+
+// SetMaxResourceSegments bounds how many SPEC §10.11 segments a
+// multi-segment Resource transfer may have, for both directions:
+// an inbound advertisement claiming more is refused at
+// openResourceReceiver before any receiver state is allocated, and
+// SendSegmentedResourceOverLink refuses to emit more.
+//
+// The default is DefaultMaxResourceSegments (16). n = 1 refuses
+// multi-segment transfers outright — the right setting for an
+// application whose own send path cannot produce them, since it would
+// otherwise be able to receive bodies it can never re-emit. Values
+// above MaxAcceptedResourceSegments are clamped to it: that ceiling
+// bounds memory an unauthenticated peer can claim and is not raisable
+// by configuration. n <= 0 restores the default.
+func (t *Transport) SetMaxResourceSegments(n int) {
+	if n <= 0 {
+		n = DefaultMaxResourceSegments
+	}
+	if n > MaxAcceptedResourceSegments {
+		n = MaxAcceptedResourceSegments
+	}
+	t.mu.Lock()
+	t.maxResourceSegments = n
+	t.mu.Unlock()
+}
+
+// maxResourceSegmentsLimit reads the configured ceiling, defaulting
+// lazily so a zero-value Transport behaves like a configured one.
+func (t *Transport) maxResourceSegmentsLimit() int {
+	t.mu.RLock()
+	n := t.maxResourceSegments
+	t.mu.RUnlock()
+	if n <= 0 {
+		return DefaultMaxResourceSegments
+	}
+	if n > MaxAcceptedResourceSegments {
+		return MaxAcceptedResourceSegments
+	}
+	return n
+}
+
+// SetSegmentAssemblyTimeouts overrides how long a partial §10.11
+// multi-segment transfer is retained: `idle` since the last segment
+// landed, and `absolute` since the first. Non-positive values keep the
+// current setting (DefaultSegmentAssemblyIdleTimeout /
+// DefaultSegmentAssemblyMaxDuration).
+//
+// `idle` must exceed the worst-case single-segment transfer time
+// (resourceTransferTimeout of a full segment, ~9m5s) or legitimate
+// transfers expire mid-flight; `absolute` is what stops a peer pinning
+// memory forever by dripping one segment per idle window.
+func (t *Transport) SetSegmentAssemblyTimeouts(idle, absolute time.Duration) {
+	if t.segments == nil {
+		return
+	}
+	t.segments.setTimeouts(idle, absolute)
 }
 
 // sendLinkIdentify builds and broadcasts the post-handshake
