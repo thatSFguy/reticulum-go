@@ -123,11 +123,33 @@ func (d *Delivery) validateInboundStamp(m *Message) bool {
 		}
 	}
 
+	// Per-sender allowance, checked BEFORE the workblock is built —
+	// the point is to not spend it. Exhaustion is attributable (a
+	// sender can only spend their own allowance, and only by failing),
+	// so unlike the global cap above this fails CLOSED under
+	// EnforceStamps without giving anyone a way to cause honest drops.
+	now := time.Now()
+	if !d.stampFailures.allow(m.SourceHash, now) {
+		m.StampChecked = false
+		m.StampValid = false
+		if d.EnforceStamps {
+			d.errorf("dropping message from %x: %d failed stamp validations already charged, refusing to spend another workblock",
+				m.SourceHash[:4], StampFailureBurstPerSender)
+			return false
+		}
+		d.errorf("skipping stamp validation for %x: failure allowance exhausted", m.SourceHash[:4])
+		return true
+	}
+
 	value, err := m.ValidateStamp(cost)
 	m.StampChecked = true
 	m.StampValue = value
 	m.StampValid = err == nil
 	if err != nil {
+		// Only failures are charged. A peer whose stamps clear is never
+		// throttled however chatty it is, so the budget cannot cost an
+		// honest sender their messages.
+		d.stampFailures.charge(m.SourceHash, now)
 		if d.EnforceStamps {
 			d.errorf("dropping message from %x: %w", m.SourceHash[:4], err)
 			return false

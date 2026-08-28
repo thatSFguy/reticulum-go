@@ -152,6 +152,13 @@ type Delivery struct {
 	// Nil disables tickets entirely — every stamp is then proof-of-work.
 	Tickets *TicketStore
 
+	// stampFailures is the per-sender allowance for FAILED stamp
+	// validations — the bound on how much workblock time one sender can
+	// cost us. See lxmf/stamp_budget.go. A pointer so Delivery stays
+	// copyable; nil (a Delivery not built by NewDelivery) means no
+	// budget. Allocated in NewDelivery.
+	stampFailures *stampBudget
+
 	// Ratchets, when set, publishes an X25519 ratchet in our announces
 	// and is tried on inbound decrypt before the long-term key (§7.3,
 	// §7.4). Nil means no ratchet: everything still works, and every
@@ -184,10 +191,11 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity, buildAnnounce
 		return nil, errors.New("nil transport or identity")
 	}
 	d := &Delivery{
-		transport: transport,
-		identity:  identity,
-		destHash:  identity.DestinationHashFor(FullName()),
-		inflight:  make(chan struct{}, MaxConcurrentInboundHandlers),
+		transport:     transport,
+		identity:      identity,
+		destHash:      identity.DestinationHashFor(FullName()),
+		inflight:      make(chan struct{}, MaxConcurrentInboundHandlers),
+		stampFailures: &stampBudget{},
 	}
 	if err := transport.RegisterLocal(&rns.LocalDestination{
 		DestHash:        d.destHash,
