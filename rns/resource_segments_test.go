@@ -499,3 +499,57 @@ func TestSetSegmentAssemblyTimeouts(t *testing.T) {
 		t.Errorf("idle=%s absolute=%s; non-positive values must keep the current setting", idle, absolute)
 	}
 }
+
+// A §10.11 assembly is keyed on its link and cannot resume across
+// links, so tearing the link down must release its retained segments
+// immediately. Waiting out the idle deadline is exploitable: exhaustion
+// REFUSES rather than evicts, so a peer that ships most of a transfer
+// and then closes the link parks bytes that no per-link cap covers
+// (each retry is a fresh link_id) and that deny honest transfers.
+func TestSegmentAssembliesReleasedOnLinkClose(t *testing.T) {
+	link, tp, _ := makeActiveTestLink(t)
+	orig := bytes.Repeat([]byte{0x71}, 32)
+	now := time.Now()
+
+	if _, err := tp.segments.add(link.ID, segAdv(t, orig, 1, 3), []byte("held"), now); err != nil {
+		t.Fatal(err)
+	}
+	if tp.segments.pending() != 1 || tp.segments.retainedBytes() != 4 {
+		t.Fatalf("pending=%d retained=%d, want 1/4", tp.segments.pending(), tp.segments.retainedBytes())
+	}
+
+	tp.linkManager.CloseLink(link.ID)
+
+	if tp.segments.pending() != 0 {
+		t.Errorf("%d assemblies survived the link that owned them", tp.segments.pending())
+	}
+	if got := tp.segments.retainedBytes(); got != 0 {
+		t.Errorf("retained %d bytes after close, want 0 — the byte budget was not released", got)
+	}
+	// The link's per-link slot must come back too, or a peer reusing a
+	// link_id after a close would be locked out of its own budget.
+	tp.segments.mu.Lock()
+	n := tp.segments.perLink[bytesHexEncode(link.ID)]
+	tp.segments.mu.Unlock()
+	if n != 0 {
+		t.Errorf("per-link counter = %d after close, want 0", n)
+	}
+}
+
+// Closing a link that holds nothing must not disturb another link's
+// in-flight assembly.
+func TestLinkCloseLeavesOtherLinksAssembliesAlone(t *testing.T) {
+	link, tp, _ := makeActiveTestLink(t)
+	other := bytes.Repeat([]byte{0x81}, IdentityHashLen)
+	orig := bytes.Repeat([]byte{0x91}, 32)
+	now := time.Now()
+
+	if _, err := tp.segments.add(other, segAdv(t, orig, 1, 2), []byte("keep"), now); err != nil {
+		t.Fatal(err)
+	}
+	tp.linkManager.CloseLink(link.ID)
+	if tp.segments.pending() != 1 || tp.segments.retainedBytes() != 4 {
+		t.Errorf("pending=%d retained=%d; closing one link disturbed another's transfer",
+			tp.segments.pending(), tp.segments.retainedBytes())
+	}
+}

@@ -261,7 +261,7 @@ func NewTransport(logger Logger) *Transport {
 	if logger == nil {
 		logger = noopLogger{}
 	}
-	return &Transport{
+	t := &Transport{
 		known:                map[string]*KnownIdentity{},
 		locals:               map[string]*LocalDestination{},
 		pathRequestsSent:     map[string]time.Time{},
@@ -272,6 +272,13 @@ func NewTransport(logger Logger) *Transport {
 		logger:               logger,
 		rlog:                 newRateLimitedLogger(logger),
 	}
+	// A §10.11 assembly is keyed on the link that carries it and cannot
+	// resume across links, so a torn-down link's retained segments are
+	// dead weight against MaxRetainedSegmentBytes. Release them with
+	// the link rather than waiting out the idle deadline — see
+	// segmentAssembler.dropLink for why that gap is exploitable.
+	t.linkManager.onLinkTornDown = t.segments.dropLink
+	return t
 }
 
 // LinkManager returns the per-Transport LinkManager. Application layer
