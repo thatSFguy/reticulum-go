@@ -156,14 +156,15 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 	// a malformed ADV should report the structural error, not "too
 	// large" — easier to debug interop issues that way.
 	//
-	// fwdsvc reassembles only single-segment resources. A body larger
-	// than MaxEfficientSize is split by RNS into l>1 segments (§10.11);
-	// accepting one segment of such a transfer would hand a truncated
-	// body to the LXMF parser. Reject the whole transfer up front.
 	// Multi-segment transfers (§10.11) are accepted and reassembled by
 	// segmentAssembler. The per-advertisement caps below bound ONE
 	// segment, so the segment count needs its own ceiling: a peer can
 	// offer a legal 1 MiB segment and simply claim a large `l`.
+	//
+	// This is the ABSOLUTE ceiling, not the effective one — a Transport
+	// may refuse a lower `l` still (SetMaxResourceSegments, applied in
+	// openResourceReceiver). Kept here so the parser stays a standalone
+	// bound for callers that use it without a Transport.
 	if adv.TotalSegments > MaxAcceptedResourceSegments {
 		return nil, fmt.Errorf("%w: %d segments, cap is %d",
 			ErrResourceTooLarge, adv.TotalSegments, MaxAcceptedResourceSegments)

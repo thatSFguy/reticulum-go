@@ -138,6 +138,18 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		return fmt.Errorf("resource receiver: link state %s, want active", state)
 	}
 
+	// SPEC §10.11 — refuse an over-limit multi-segment transfer at the
+	// advertisement, before any receiver state is allocated. Enforcing
+	// this only in segmentAssembler.add would be too late: by then a
+	// whole segment transfer has been received, buffered, decrypted and
+	// proved. ParseResourceAdv already applied the absolute
+	// MaxAcceptedResourceSegments ceiling; this is the tighter
+	// per-Transport policy layered above it (1 = refuse multi-segment).
+	if maxSegments := t.maxResourceSegmentsLimit(); adv.TotalSegments > maxSegments {
+		return fmt.Errorf("resource receiver: %w: advertisement claims %d segments, this transport accepts %d",
+			ErrResourceTooLarge, adv.TotalSegments, maxSegments)
+	}
+
 	// Cap inbound concurrent receivers per link — defends against a
 	// peer that floods us with distinct-hash ADVs, which would
 	// otherwise spawn one receiver goroutine per ADV (each living up
