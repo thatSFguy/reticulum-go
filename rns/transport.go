@@ -1146,6 +1146,54 @@ func (t *Transport) handleLinkIdentify(p *Packet) {
 	}
 }
 
+// TeardownLink closes a link and tells the peer, so the peer does not
+// have to wait out its own watchdog before noticing (SPEC §6.7.2 step
+// 4, and §6.7.3 for the packet).
+//
+// This is the close a consumer should use whenever it knows a link is
+// finished — a session ending, a client being disconnected, a shutdown.
+// LinkManager.CloseLink remains the silent form, for the handshake
+// paths where there is no established link to send anything on.
+//
+// A failure to send is not a failure to close: the link is torn down
+// locally either way, and the peer falls back to the watchdog exactly
+// as it did before.
+func (t *Transport) TeardownLink(linkID []byte) {
+	l := t.linkManager.Get(linkID)
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	active := l.State == LinkActive
+	signing, encryption := l.Signing, l.Encryption
+	l.mu.Unlock()
+
+	// Built before the close, because CloseLink zeroes the session keys
+	// this packet is encrypted under.
+	if active {
+		if pkt, err := BuildLinkClose(linkID, signing, encryption); err != nil {
+			t.logger.Printf("build linkclose for %x: %v", linkID[:4], err)
+		} else if err := t.Broadcast(pkt); err != nil {
+			t.logger.Printf("send linkclose for %x: %v", linkID[:4], err)
+		}
+	}
+	t.linkManager.closeLink(linkID, TeardownTimeout, true)
+}
+
+// handleLinkClose processes an inbound §6.7.3 LINKCLOSE.
+func (t *Transport) handleLinkClose(p *Packet) {
+	link, reason, err := t.linkManager.HandleLinkClose(p)
+	if err != nil {
+		// Expected in normal operation: a retransmitted LINKCLOSE
+		// arrives after the link is already gone. Logged rather than
+		// ignored because an authentication failure looks the same
+		// from here and is worth seeing.
+		t.logger.Printf("link close: %v", err)
+		return
+	}
+	t.logger.Printf("link %x closed by peer (SPEC §6.7.3, reason 0x%02x)", link.ID[:4], reason)
+}
+
 // handleLinkData processes inbound DATA packets addressed to a link_id.
 // Decrypts via the LinkManager, emits the SPEC §6.5.6 explicit-form
 // PROOF acknowledging the packet, then forwards plaintext to the link's
@@ -1230,6 +1278,17 @@ func (t *Transport) handleLinkData(p *Packet) {
 		// it inside Link.receive() rather than surfacing the raw frame
 		// to the application.
 		t.handleLinkIdentify(p)
+		return
+	case ContextLinkClose:
+		// SPEC §6.7.3 — the peer tearing the link down cleanly.
+		// Consumed here, as upstream consumes it inside Link.receive().
+		//
+		// Without this branch a clean teardown fell through to the
+		// default below and was discarded, so both sides waited out
+		// their own watchdogs — and a consumer holding per-link state
+		// went on believing a departed peer was present for as long as
+		// that took.
+		t.handleLinkClose(p)
 		return
 	default:
 		// Other contexts (REQUEST/RESPONSE/etc) — out of scope for fwdsvc.
@@ -1743,7 +1802,10 @@ func (t *Transport) sweepLinks() {
 	for _, a := range actions {
 		if a.close {
 			t.logger.Printf("link sweep: closing idle link %x", a.linkID[:4])
-			t.linkManager.CloseLink(a.linkID)
+			// SPEC §6.7.2 step 4: emit a LINKCLOSE on the watchdog
+			// path too, so the peer does not sit through its own
+			// timeout to reach the same conclusion we just did.
+			t.TeardownLink(a.linkID)
 			continue
 		}
 		if a.keepalive {

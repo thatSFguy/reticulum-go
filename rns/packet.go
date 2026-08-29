@@ -42,7 +42,7 @@ const (
 const (
 	ContextNone         = 0x00
 	ContextPathResponse = 0x0B
-	// ContextLinkIdentify (SPEC §6.6) is the link-DATA context byte for
+	// ContextLinkIdentify (SPEC §6.7.6) is the link-DATA context byte for
 	// LINKIDENTIFY — an initiator-emitted, link-encrypted packet that
 	// proves which identity (and therefore which destination) the link
 	// is being driven from. Plaintext is identity_hash(16) ||
@@ -53,7 +53,14 @@ const (
 	// forwarding-relay group chats where the LXMF source_hash on
 	// link-delivered bubbles is the relay, not the human originator.
 	ContextLinkIdentify = 0xFB
-	ContextLRProof      = 0xFF
+	// ContextLinkClose (SPEC §6.7.3) is the link-DATA context byte for
+	// LINKCLOSE — a clean teardown notification either side may send.
+	// Plaintext is the 16-byte link_id, link-encrypted; a receiver MUST
+	// check it equals the link it arrived on before acting, because the
+	// dest_hash a LINKCLOSE is addressed to is the link_id itself and
+	// is therefore visible to anyone who can observe the link.
+	ContextLinkClose = 0xFC
+	ContextLRProof   = 0xFF
 )
 
 const (
