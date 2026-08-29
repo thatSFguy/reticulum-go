@@ -145,6 +145,28 @@ func buildAnnounce(
 	if ratchetPub != nil {
 		bodyLen += ratchetPubLen
 	}
+	// SPEC §4.5: an announce must fit the 500-byte Reticulum MTU.
+	//
+	// Upstream has always refused to emit one that doesn't — Packet.pack
+	// raises when len(raw) > self.MTU, and for any non-LINK destination
+	// that MTU is Reticulum.MTU = 500 (Packet.py:157, :238), long-standing
+	// behaviour rather than new. RNS 1.5.2 added the matching receive-side
+	// rule: Transport.preprocess_inbound drops an ANNOUNCE whose raw frame
+	// exceeds Reticulum.MTU as a protocol violation, *before*
+	// validate_announce runs (Transport.py:1804). That closes a real gap,
+	// since an interface's own HW_MTU permits up to 512 KiB, so an
+	// oversized announce used to reach full signature validation.
+	//
+	// Packet.Pack can't carry this bound generally — a link destination's
+	// MTU is negotiated in §6 signalling and may exceed 500 — so enforce
+	// it here, where the destination type is known.
+	if header1MinLen+bodyLen > ReticulumMTU {
+		return nil, fmt.Errorf(
+			"announce frame would be %d bytes, over the %d-byte MTU (SPEC §4.5): app_data is %d bytes, at most %d fits",
+			header1MinLen+bodyLen, ReticulumMTU, len(appData),
+			ReticulumMTU-header1MinLen-(bodyLen-len(appData)))
+	}
+
 	body := make([]byte, 0, bodyLen)
 	body = append(body, id.PublicKey()...)
 	body = append(body, nameHash...)

@@ -182,6 +182,17 @@ func ParsePacket(raw []byte) (*Packet, error) {
 	default:
 		return nil, fmt.Errorf("unknown header_type %d", headerType)
 	}
+
+	// SPEC §2.2: since RNS 1.5.2 Packet.unpack raises on an empty data
+	// field (Packet.py:275); 1.4.2 and 1.5.0 accepted it. The drop applies
+	// on every interface, not only the ones whose framing already excluded
+	// it — TCPInterface has refused frames <= HEADER_MINSIZE (19) since
+	// before 1.4.2, but that bound never caught a zero-data HEADER_2
+	// frame, which is 35 bytes and clears it. Mirror the rejection so our
+	// dispatchers never act on a packet upstream would discard.
+	if len(p.Data) == 0 {
+		return nil, errors.New("zero-length data field")
+	}
 	return p, nil
 }
 

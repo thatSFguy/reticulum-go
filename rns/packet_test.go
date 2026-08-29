@@ -323,3 +323,44 @@ func TestPackRefusesHopsAtTheLimit(t *testing.T) {
 		t.Error("ParsePacket accepted hops at the limit")
 	}
 }
+
+// Upstream RNS 1.5.2 raises on an empty data field in Packet.unpack
+// (Packet.py:275), where 1.4.2 and 1.5.0 accepted it. The HEADER_2 case
+// is the one that framing never caught: at 35 bytes it clears
+// TCPInterface's `frame_len <= HEADER_MINSIZE` (19) bound.
+func TestParseRejectsZeroLengthData(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pkt  *Packet
+	}{
+		{"HEADER_1", &Packet{
+			HeaderType:      HeaderType1,
+			TransportType:   BroadcastTransport,
+			DestinationType: DestinationSingle,
+			PacketType:      PacketData,
+			DestHash:        make([]byte, addressHashLen),
+			Context:         ContextNone,
+			Data:            nil,
+		}},
+		{"HEADER_2", &Packet{
+			HeaderType:      HeaderType2,
+			TransportType:   NetworkTransport,
+			DestinationType: DestinationSingle,
+			PacketType:      PacketData,
+			TransportID:     make([]byte, addressHashLen),
+			DestHash:        make([]byte, addressHashLen),
+			Context:         ContextNone,
+			Data:            nil,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := tc.pkt.Pack()
+			if err != nil {
+				t.Fatalf("Pack: %v", err)
+			}
+			if _, err := ParsePacket(wire); err == nil {
+				t.Errorf("ParsePacket(%d-byte zero-data frame) = nil error, want rejection", len(wire))
+			}
+		})
+	}
+}

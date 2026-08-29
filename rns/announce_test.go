@@ -398,3 +398,34 @@ func FuzzDecodeLXMFAppDataStampCost(f *testing.F) {
 		}
 	})
 }
+
+// SPEC §4.5: an announce must fit the 500-byte Reticulum MTU. Upstream
+// refuses to emit one that doesn't (Packet.py:238) and, since RNS 1.5.2,
+// drops one that arrives as a protocol violation (Transport.py:1804).
+func TestBuildAnnounceRejectsOverMTUAppData(t *testing.T) {
+	id, err := NewIdentity()
+	if err != nil {
+		t.Fatalf("NewIdentity: %v", err)
+	}
+	ratchet := make([]byte, ratchetPubLen)
+
+	// Largest app_data that still fits: 500 - 19 (HEADER_1) - 180 (body
+	// with ratchet) = 301.
+	const maxAppData = ReticulumMTU - header1MinLen - announceMinWithRatch
+
+	pkt, err := BuildAnnounce(id, "lxmf.delivery", make([]byte, maxAppData), ratchet)
+	if err != nil {
+		t.Fatalf("BuildAnnounce at the %d-byte app_data limit: %v", maxAppData, err)
+	}
+	wire, err := pkt.Pack()
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	if len(wire) != ReticulumMTU {
+		t.Errorf("announce at the limit packed to %d bytes, want exactly %d", len(wire), ReticulumMTU)
+	}
+
+	if _, err := BuildAnnounce(id, "lxmf.delivery", make([]byte, maxAppData+1), ratchet); err == nil {
+		t.Errorf("BuildAnnounce with %d-byte app_data = nil error, want refusal", maxAppData+1)
+	}
+}
