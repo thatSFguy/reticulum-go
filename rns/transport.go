@@ -1675,21 +1675,7 @@ func (t *Transport) SetLinkLifetime(keepalive, idle, sweep time.Duration) {
 //
 // Run as a goroutine alongside Transport.Run. Returns when ctx is done.
 func (t *Transport) RunLinkSweeper(ctx context.Context) {
-	t.mu.Lock()
-	if t.lifetime == nil {
-		t.lifetime = &linkLifetime{}
-	}
-	if t.lifetime.keepalive == 0 {
-		t.lifetime.keepalive = DefaultLinkKeepaliveInterval
-	}
-	if t.lifetime.idle == 0 {
-		t.lifetime.idle = DefaultLinkIdleTimeout
-	}
-	if t.lifetime.sweep == 0 {
-		t.lifetime.sweep = DefaultLinkSweepInterval
-	}
-	sweepInterval := t.lifetime.sweep
-	t.mu.Unlock()
+	sweepInterval := t.ensureLifetime().sweep
 
 	tick := time.NewTicker(sweepInterval)
 	defer tick.Stop()
@@ -1703,13 +1689,38 @@ func (t *Transport) RunLinkSweeper(ctx context.Context) {
 	}
 }
 
+// ensureLifetime fills in any unset lifetime parameter with its default
+// and returns a copy of the result.
+//
+// Both RunLinkSweeper and sweepLinks go through it. sweepLinks is
+// documented as directly drivable by tests, and a Transport that has
+// never run the sweeper has no lifetime struct at all — it is built
+// lazily — so reading t.lifetime.idle there dereferenced nil on exactly
+// the call pattern the doc invites.
+func (t *Transport) ensureLifetime() linkLifetime {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.lifetime == nil {
+		t.lifetime = &linkLifetime{}
+	}
+	if t.lifetime.keepalive == 0 {
+		t.lifetime.keepalive = DefaultLinkKeepaliveInterval
+	}
+	if t.lifetime.idle == 0 {
+		t.lifetime.idle = DefaultLinkIdleTimeout
+	}
+	if t.lifetime.sweep == 0 {
+		t.lifetime.sweep = DefaultLinkSweepInterval
+	}
+	return *t.lifetime
+}
+
 // sweepLinks is one pass of the link housekeeping loop. Exposed so
 // tests can drive it deterministically without depending on the ticker.
 func (t *Transport) sweepLinks() {
-	t.mu.RLock()
-	keepalive := t.lifetime.keepalive
-	idle := t.lifetime.idle
-	t.mu.RUnlock()
+	lifetime := t.ensureLifetime()
+	keepalive := lifetime.keepalive
+	idle := lifetime.idle
 
 	now := time.Now()
 	type action struct {

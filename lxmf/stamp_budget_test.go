@@ -255,6 +255,28 @@ func bogusStamped(t *testing.T, sender *rns.Identity) *Message {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	m.Stamp = bytes.Repeat([]byte{0xAB}, StampSize)
+	// A fixed stamp is not automatically a FAILING stamp. The workblock
+	// derives from message_id, which is fresh for every message built
+	// here, so any given 32 bytes clear testStampCost (6 bits) for
+	// roughly one message in 64. Drawing four per run made this test
+	// fail ~6% of the time with "failure N was accepted under
+	// EnforceStamps" — a real flake, not a real bug.
+	//
+	// Ask the validator that the test will ask, and perturb until the
+	// stamp genuinely does not clear the cost, so "bogus" is a property
+	// of the message rather than a probability. Using the real oracle
+	// rather than re-deriving the workblock here means this cannot
+	// silently drift back into flakiness if the derivation changes.
+	for i := 0; ; i++ {
+		stamp := bytes.Repeat([]byte{0xAB}, StampSize)
+		stamp[0] = byte(i)
+		m.Stamp = stamp
+		if _, err := m.ValidateStamp(testStampCost); err != nil {
+			break
+		}
+		if i == 32 {
+			t.Fatalf("could not build a stamp that fails cost %d in %d tries", testStampCost, i)
+		}
+	}
 	return m
 }
