@@ -506,11 +506,14 @@ func (lm *LinkManager) resourceAssembledHandler() func(linkID, body []byte) {
 // room, and anything keyed on "is this peer here?" is confidently wrong
 // for the whole window.
 //
-// The callback receives the link_id and a §6.7.4 teardown reason. It
-// fires from two paths — an inbound LINKCLOSE and a local CloseLink —
-// so implementations must be idempotent (SPEC §12, pitfall 3). It is
-// invoked without the manager lock held, so a handler may call back
-// into the LinkManager.
+// The callback receives the link_id and a teardown reason — one of the
+// three §6.7.4 values, or TeardownLocalClosed when we closed it
+// ourselves. It fires only for a link that reached Active, and exactly
+// once per closure, but implementations should still be idempotent
+// (SPEC §12, pitfall 3): the closure can originate from an inbound
+// LINKCLOSE, the idle sweep, or a local teardown. It is invoked without
+// the manager lock held, so a handler may call back into the
+// LinkManager.
 func (lm *LinkManager) SetLinkClosedHandler(cb func(linkID []byte, reason byte)) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
@@ -975,27 +978,41 @@ func (lm *LinkManager) HandleLinkData(p *Packet) ([]byte, *Link, error) {
 // Idempotent. Also cancels every in-flight Resource transfer bound to
 // this link — without that, sender/receiver goroutines would block
 // forever on a dead link's REQ/PRF channels.
+//
+// "Silent" here means it sends the peer nothing, not that the local
+// consumer hears nothing: a link that was Active still reports closed
+// through SetLinkClosedHandler. Use Transport.TeardownLink when the
+// peer should be told as well.
 func (lm *LinkManager) CloseLink(linkID []byte) {
-	lm.closeLink(linkID, TeardownTimeout, true)
+	lm.closeLink(linkID, TeardownTimeout)
 }
 
-// closeLink is CloseLink with the teardown reason and whether the
-// callback should fire. notify is false only on the path that has
-// already reported the close, so a peer-initiated teardown does not
-// deliver two callbacks for one event.
+// closeLink is CloseLink with an explicit §6.7.4 teardown reason.
+//
+// The callback fires only for a link that was ACTIVE when we closed it,
+// which is a stricter test than "was in the map" and deliberately so.
+// Half the internal callers close a link that never established — a
+// LINKREQUEST whose broadcast failed, a handshake that timed out — and
+// a consumer tracking presence must not be told a link closed when no
+// link ever opened. Registration happens at StartLinkAsInitiator, long
+// before the LRPROOF, so map membership does not imply a peer.
+//
+// It doubles as the idempotency guard: the state flips to Closed under
+// the lock here, so a second close of the same link finds it non-Active
+// and reports nothing. One closure, one callback (SPEC §12 pitfall 3).
 //
 // The key ordering rule: the session keys are read and the map entry
 // removed under the lock, then everything with side effects — the
 // callback, the resource cancellation — happens after it is released.
 // A handler that calls back into the LinkManager would otherwise
 // deadlock, and a handler is exactly the kind of code that wants to.
-func (lm *LinkManager) closeLink(linkID []byte, reason byte, notify bool) {
+func (lm *LinkManager) closeLink(linkID []byte, reason byte) {
 	lm.mu.Lock()
 	key := hex.EncodeToString(linkID)
-	existed := false
+	wasActive := false
 	if l, ok := lm.links[key]; ok {
-		existed = true
 		l.mu.Lock()
+		wasActive = l.State == LinkActive
 		l.State = LinkClosed
 		l.Signing = nil
 		l.Encryption = nil
@@ -1009,10 +1026,7 @@ func (lm *LinkManager) closeLink(linkID []byte, reason byte, notify bool) {
 	// release ours to keep lock ordering consistent.
 	lm.closeResourcesForLink(linkID)
 
-	// Only for a link that was actually here. CloseLink is idempotent
-	// and is called speculatively on paths that may race, and a
-	// consumer must not be told twice that one link closed.
-	if notify && existed && cb != nil {
+	if wasActive && cb != nil {
 		cb(append([]byte(nil), linkID...), reason)
 	}
 }
@@ -1054,7 +1068,7 @@ func (lm *LinkManager) HandleLinkClose(p *Packet) (*Link, byte, error) {
 	if initiator {
 		reason = TeardownDestinationClosed
 	}
-	lm.closeLink(linkID, reason, true)
+	lm.closeLink(linkID, reason)
 	return l, reason, nil
 }
 

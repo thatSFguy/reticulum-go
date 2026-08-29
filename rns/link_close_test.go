@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sync"
 	"testing"
+	"time"
 )
 
 // --- the packet -------------------------------------------------------
@@ -234,5 +235,127 @@ func TestTeardownLinkSendsALinkClosePacket(t *testing.T) {
 	}
 	if tp.linkManager.Get(linkID) != nil {
 		t.Error("TeardownLink sent the packet but left the link open")
+	}
+}
+
+// --- which closures a consumer hears about, and as what --------------
+
+// A link that never reached Active must not be reported as closed. The
+// internal cleanup paths — a LINKREQUEST whose broadcast failed, a
+// handshake that timed out — all close a link that was registered at
+// StartLinkAsInitiator but never established. A consumer tracking
+// presence would otherwise be told a peer left when none ever arrived.
+func TestClosingALinkThatNeverEstablishedReportsNothing(t *testing.T) {
+	_, tp, _ := makeActiveTestLink(t)
+
+	pending := &Link{
+		ID:           bytes.Repeat([]byte{0xCD}, IdentityHashLen),
+		State:        LinkPending,
+		CreatedAt:    time.Now(),
+		LastActivity: time.Now(),
+	}
+	tp.linkManager.mu.Lock()
+	tp.linkManager.links[bytesHexEncode(pending.ID)] = pending
+	tp.linkManager.mu.Unlock()
+
+	var mu sync.Mutex
+	var calls int
+	tp.linkManager.SetLinkClosedHandler(func([]byte, byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+	})
+
+	tp.linkManager.CloseLink(pending.ID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 0 {
+		t.Errorf("handler fired %d times for a link that never established, want 0", calls)
+	}
+}
+
+// SPEC §6.7.2 gives the teardown reason one job: let the application
+// "distinguish 'the peer went dark' from 'the peer cleanly closed'".
+// A deliberate local teardown is not a timeout and must not say it is.
+func TestTeardownLinkReportsALocalClose(t *testing.T) {
+	link, tp, _ := makeActiveTestLink(t)
+
+	var mu sync.Mutex
+	var got []byte
+	tp.linkManager.SetLinkClosedHandler(func(_ []byte, reason byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, reason)
+	})
+
+	tp.TeardownLink(append([]byte(nil), link.ID...))
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("handler fired %d times, want 1", len(got))
+	}
+	if got[0] != TeardownLocalClosed {
+		t.Errorf("local teardown reported reason 0x%02x, want TeardownLocalClosed (0x%02x)",
+			got[0], TeardownLocalClosed)
+	}
+}
+
+// The other half of the same distinction: the idle sweep IS the
+// watchdog, so it reports TIMEOUT — and per SPEC §6.7.2 it also emits
+// the teardown packet rather than letting the peer time out too.
+func TestTheIdleSweepReportsTimeoutAndTellsThePeer(t *testing.T) {
+	link, tp, iface := makeActiveTestLink(t)
+	linkID := append([]byte(nil), link.ID...)
+	signing := append([]byte(nil), link.Signing...)
+	encryption := append([]byte(nil), link.Encryption...)
+
+	// Explicit, so the test does not ride on the default thresholds.
+	// sweepLinks reads t.lifetime, which is lazily built — a Transport
+	// that has never run the sweeper has none.
+	tp.SetLinkLifetime(30*time.Second, time.Minute, time.Minute)
+
+	link.mu.Lock()
+	link.LastActivity = time.Now().Add(-24 * time.Hour)
+	link.mu.Unlock()
+
+	var mu sync.Mutex
+	var got []byte
+	tp.linkManager.SetLinkClosedHandler(func(_ []byte, reason byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, reason)
+	})
+
+	tp.sweepLinks()
+
+	mu.Lock()
+	if len(got) != 1 {
+		mu.Unlock()
+		t.Fatalf("handler fired %d times on the idle sweep, want 1", len(got))
+	}
+	if got[0] != TeardownTimeout {
+		t.Errorf("idle sweep reported reason 0x%02x, want TeardownTimeout (0x%02x)",
+			got[0], TeardownTimeout)
+	}
+	mu.Unlock()
+
+	var found *Packet
+	for _, raw := range iface.Snapshot() {
+		p, err := ParsePacket(raw)
+		if err != nil {
+			continue
+		}
+		if p.Context == ContextLinkClose {
+			found = p
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("the idle sweep sent no LINKCLOSE (SPEC §6.7.2)")
+	}
+	if err := ParseLinkClosePacket(found, linkID, signing, encryption); err != nil {
+		t.Errorf("the sweep's LINKCLOSE does not authenticate: %v", err)
 	}
 }

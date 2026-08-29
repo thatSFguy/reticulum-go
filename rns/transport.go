@@ -1158,7 +1158,18 @@ func (t *Transport) handleLinkIdentify(p *Packet) {
 // A failure to send is not a failure to close: the link is torn down
 // locally either way, and the peer falls back to the watchdog exactly
 // as it did before.
+//
+// The local consumer is told TeardownLocalClosed, not TeardownTimeout:
+// nothing timed out here, we decided. Only the idle sweep reports
+// TIMEOUT, via teardownLink.
 func (t *Transport) TeardownLink(linkID []byte) {
+	t.teardownLink(linkID, TeardownLocalClosed)
+}
+
+// teardownLink is TeardownLink with the §6.7.4 reason the local
+// consumer should be told. It is unexported because the sweep is the
+// only caller that has a reason other than "we closed it".
+func (t *Transport) teardownLink(linkID []byte, reason byte) {
 	l := t.linkManager.Get(linkID)
 	if l == nil {
 		return
@@ -1177,7 +1188,7 @@ func (t *Transport) TeardownLink(linkID []byte) {
 			t.logger.Printf("send linkclose for %x: %v", linkID[:4], err)
 		}
 	}
-	t.linkManager.closeLink(linkID, TeardownTimeout, true)
+	t.linkManager.closeLink(linkID, reason)
 }
 
 // handleLinkClose processes an inbound §6.7.3 LINKCLOSE.
@@ -1802,10 +1813,12 @@ func (t *Transport) sweepLinks() {
 	for _, a := range actions {
 		if a.close {
 			t.logger.Printf("link sweep: closing idle link %x", a.linkID[:4])
-			// SPEC §6.7.2 step 4: emit a LINKCLOSE on the watchdog
-			// path too, so the peer does not sit through its own
-			// timeout to reach the same conclusion we just did.
-			t.TeardownLink(a.linkID)
+			// SPEC §6.7.2: the watchdog emits a teardown packet AND
+			// sets teardown_reason = TIMEOUT, so the peer does not sit
+			// through its own timeout to reach the conclusion we just
+			// did, and our own consumer can tell "went dark" from
+			// "cleanly closed" — the one job §6.7.2 gives the reason.
+			t.teardownLink(a.linkID, TeardownTimeout)
 			continue
 		}
 		if a.keepalive {

@@ -386,6 +386,18 @@ func msgpackMarshalFloat64(v float64) ([]byte, error) {
 // LINKCLOSE packet carries no reason code, and a receiver infers which
 // applies from whether it is the initiator or the responder.
 const (
+	// TeardownLocalClosed is NOT a §6.7.4 value — that table has no
+	// entry for "we closed it ourselves", because upstream's teardown()
+	// leaves teardown_reason unset on a local close and only the three
+	// values below are ever assigned. This makes that absence explicit
+	// rather than borrowing a reason that describes something else.
+	//
+	// It matters because §6.7.2 gives the reason exactly one job: let
+	// the application "distinguish 'the peer went dark' from 'the peer
+	// cleanly closed'". Reporting TIMEOUT for a deliberate local
+	// teardown destroys the distinction the field exists to carry.
+	TeardownLocalClosed = 0x00
+
 	TeardownTimeout           = 0x01 // watchdog STALE → CLOSED; no LINKCLOSE seen
 	TeardownInitiatorClosed   = 0x02 // we are the responder; the initiator closed
 	TeardownDestinationClosed = 0x03 // we are the initiator; the responder closed
