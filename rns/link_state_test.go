@@ -3,6 +3,7 @@ package rns
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 // TestLinkHandshakeEndToEnd exercises the initiator + responder state
@@ -502,4 +503,43 @@ func TestHandshakeRecordsNegotiatedMTU(t *testing.T) {
 			t.Errorf("SDU = %d, want base %d", got, ResourceSDU)
 		}
 	})
+}
+
+// sweepLinks is documented as directly drivable by tests, but the
+// lifetime parameters it reads are built lazily by RunLinkSweeper — so
+// on a Transport that has never run the sweeper it used to dereference
+// a nil *linkLifetime and panic on exactly the call the doc invites.
+func TestSweepLinksOnAFreshTransportUsesDefaults(t *testing.T) {
+	link, tp, _ := makeActiveTestLink(t)
+
+	// No SetLinkLifetime, no RunLinkSweeper: t.lifetime is still nil.
+	tp.sweepLinks()
+
+	// The defaults must actually be applied, not just survived: a link
+	// active a moment ago is neither swept nor keepalive'd.
+	if l := tp.linkManager.Get(link.ID); l == nil {
+		t.Fatal("a freshly active link was closed by the sweep")
+	}
+	lifetime := tp.ensureLifetime()
+	if lifetime.idle != DefaultLinkIdleTimeout {
+		t.Errorf("idle = %v, want the default %v", lifetime.idle, DefaultLinkIdleTimeout)
+	}
+	if lifetime.keepalive != DefaultLinkKeepaliveInterval {
+		t.Errorf("keepalive = %v, want the default %v", lifetime.keepalive, DefaultLinkKeepaliveInterval)
+	}
+	if lifetime.sweep != DefaultLinkSweepInterval {
+		t.Errorf("sweep = %v, want the default %v", lifetime.sweep, DefaultLinkSweepInterval)
+	}
+}
+
+// An explicit SetLinkLifetime must still win over the defaults that
+// ensureLifetime fills in.
+func TestSetLinkLifetimeSurvivesEnsure(t *testing.T) {
+	_, tp, _ := makeActiveTestLink(t)
+	tp.SetLinkLifetime(3*time.Second, 4*time.Second, 5*time.Second)
+
+	lifetime := tp.ensureLifetime()
+	if lifetime.keepalive != 3*time.Second || lifetime.idle != 4*time.Second || lifetime.sweep != 5*time.Second {
+		t.Errorf("ensureLifetime overwrote explicit settings: %+v", lifetime)
+	}
 }
