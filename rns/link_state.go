@@ -310,6 +310,11 @@ type LinkManager struct {
 	// LINKIDENTIFY on a link we responded to.
 	defaultOnRemoteIdentified func(linkID, pubKey []byte)
 
+	// defaultOnLinkClosed fires when a link leaves Active, whether
+	// because the peer sent a §6.7.3 LINKCLOSE or because we closed it
+	// ourselves. See SetLinkClosedHandler.
+	defaultOnLinkClosed func(linkID []byte, reason byte)
+
 	// senders / receivers index in-flight Resource transfers per link
 	// keyed by hex(link_id) || hex(resource_hash) so the Transport
 	// dispatcher can route inbound RESOURCE_REQ / RESOURCE_PRF /
@@ -490,6 +495,37 @@ func (lm *LinkManager) resourceAssembledHandler() func(linkID, body []byte) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
 	return lm.defaultOnResourceAssembled
+}
+
+// SetLinkClosedHandler registers a callback fired when a link closes.
+//
+// It exists because a consumer holding per-link state — a session, a
+// subscription, a presence entry — otherwise has no way to learn the
+// link is gone, and must wait out its own timer. That wait is not
+// harmless: a chat hub goes on listing a departed user as present in a
+// room, and anything keyed on "is this peer here?" is confidently wrong
+// for the whole window.
+//
+// The callback receives the link_id and a teardown reason — one of the
+// three §6.7.4 values, or TeardownLocalClosed when we closed it
+// ourselves. It fires only for a link that reached Active, and exactly
+// once per closure, but implementations should still be idempotent
+// (SPEC §12, pitfall 3): the closure can originate from an inbound
+// LINKCLOSE, the idle sweep, or a local teardown. It is invoked without
+// the manager lock held, so a handler may call back into the
+// LinkManager.
+func (lm *LinkManager) SetLinkClosedHandler(cb func(linkID []byte, reason byte)) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lm.defaultOnLinkClosed = cb
+}
+
+// linkClosedHandler returns the manager-level link-closed callback under
+// lock, or nil if none is set.
+func (lm *LinkManager) linkClosedHandler() func(linkID []byte, reason byte) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.defaultOnLinkClosed
 }
 
 // SetRemoteIdentifiedHandler registers a callback fired when a peer
@@ -942,21 +978,98 @@ func (lm *LinkManager) HandleLinkData(p *Packet) ([]byte, *Link, error) {
 // Idempotent. Also cancels every in-flight Resource transfer bound to
 // this link — without that, sender/receiver goroutines would block
 // forever on a dead link's REQ/PRF channels.
+//
+// "Silent" here means it sends the peer nothing, not that the local
+// consumer hears nothing: a link that was Active still reports closed
+// through SetLinkClosedHandler. Use Transport.TeardownLink when the
+// peer should be told as well.
 func (lm *LinkManager) CloseLink(linkID []byte) {
+	lm.closeLink(linkID, TeardownTimeout)
+}
+
+// closeLink is CloseLink with an explicit §6.7.4 teardown reason.
+//
+// The callback fires only for a link that was ACTIVE when we closed it,
+// which is a stricter test than "was in the map" and deliberately so.
+// Half the internal callers close a link that never established — a
+// LINKREQUEST whose broadcast failed, a handshake that timed out — and
+// a consumer tracking presence must not be told a link closed when no
+// link ever opened. Registration happens at StartLinkAsInitiator, long
+// before the LRPROOF, so map membership does not imply a peer.
+//
+// It doubles as the idempotency guard: the state flips to Closed under
+// the lock here, so a second close of the same link finds it non-Active
+// and reports nothing. One closure, one callback (SPEC §12 pitfall 3).
+//
+// The key ordering rule: the session keys are read and the map entry
+// removed under the lock, then everything with side effects — the
+// callback, the resource cancellation — happens after it is released.
+// A handler that calls back into the LinkManager would otherwise
+// deadlock, and a handler is exactly the kind of code that wants to.
+func (lm *LinkManager) closeLink(linkID []byte, reason byte) {
 	lm.mu.Lock()
 	key := hex.EncodeToString(linkID)
+	wasActive := false
 	if l, ok := lm.links[key]; ok {
 		l.mu.Lock()
+		wasActive = l.State == LinkActive
 		l.State = LinkClosed
 		l.Signing = nil
 		l.Encryption = nil
 		l.mu.Unlock()
 		delete(lm.links, key)
 	}
+	cb := lm.defaultOnLinkClosed
 	lm.mu.Unlock()
+
 	// closeResourcesForLink takes the lock itself; call after we
 	// release ours to keep lock ordering consistent.
 	lm.closeResourcesForLink(linkID)
+
+	if wasActive && cb != nil {
+		cb(append([]byte(nil), linkID...), reason)
+	}
+}
+
+// HandleLinkClose processes an inbound §6.7.3 LINKCLOSE: authenticates
+// it against the link's session key, closes the link, and reports the
+// §6.7.4 reason appropriate to which side we are.
+//
+// An unauthenticated or unknown LINKCLOSE closes nothing — see
+// ParseLinkClosePacket for why that check is the whole point.
+func (lm *LinkManager) HandleLinkClose(p *Packet) (*Link, byte, error) {
+	if p == nil {
+		return nil, 0, errors.New("nil packet")
+	}
+	l := lm.Get(p.DestHash)
+	if l == nil {
+		return nil, 0, fmt.Errorf("LINKCLOSE for unknown link_id %x", p.DestHash)
+	}
+	l.mu.Lock()
+	if l.State != LinkActive {
+		state := l.State
+		l.mu.Unlock()
+		return l, 0, fmt.Errorf("LINKCLOSE on link in state %s", state)
+	}
+	signing, encryption := l.Signing, l.Encryption
+	linkID := append([]byte(nil), l.ID...)
+	// IsInitiator's own definition, inlined because we already hold the
+	// lock it would take.
+	initiator := l.responderIdentity == nil && l.peerDestHash != nil
+	l.mu.Unlock()
+
+	if err := ParseLinkClosePacket(p, linkID, signing, encryption); err != nil {
+		return l, 0, err
+	}
+
+	// SPEC §6.7.4: the reason is inferred from which side we are, since
+	// the packet carries no reason code.
+	reason := byte(TeardownInitiatorClosed)
+	if initiator {
+		reason = TeardownDestinationClosed
+	}
+	lm.closeLink(linkID, reason)
+	return l, reason, nil
 }
 
 // ActiveCount returns the number of links currently in Active state.

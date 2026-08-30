@@ -2,6 +2,7 @@ package rns
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -377,4 +378,88 @@ func msgpackMarshalFloat64(v float64) ([]byte, error) {
 	out[7] = byte(bits >> 8)
 	out[8] = byte(bits)
 	return out, nil
+}
+
+// --- LINKCLOSE (SPEC §6.7.3) ------------------------------------------
+
+// Teardown reasons (SPEC §6.7.4). These are LOCAL state values; the
+// LINKCLOSE packet carries no reason code, and a receiver infers which
+// applies from whether it is the initiator or the responder.
+const (
+	// TeardownLocalClosed is NOT a §6.7.4 value — that table has no
+	// entry for "we closed it ourselves", because upstream's teardown()
+	// leaves teardown_reason unset on a local close and only the three
+	// values below are ever assigned. This makes that absence explicit
+	// rather than borrowing a reason that describes something else.
+	//
+	// It matters because §6.7.2 gives the reason exactly one job: let
+	// the application "distinguish 'the peer went dark' from 'the peer
+	// cleanly closed'". Reporting TIMEOUT for a deliberate local
+	// teardown destroys the distinction the field exists to carry.
+	TeardownLocalClosed = 0x00
+
+	TeardownTimeout           = 0x01 // watchdog STALE → CLOSED; no LINKCLOSE seen
+	TeardownInitiatorClosed   = 0x02 // we are the responder; the initiator closed
+	TeardownDestinationClosed = 0x03 // we are the initiator; the responder closed
+)
+
+// BuildLinkClose builds the §6.7.3 teardown packet for a link: DATA,
+// context 0xFC, dest_hash = link_id, body = the link_id encrypted under
+// the link's session key.
+//
+// The body is not redundant with the dest_hash it duplicates. dest_hash
+// is plaintext on the wire and therefore forgeable by anyone who has
+// seen a packet on this link; the encrypted copy is what proves the
+// sender holds the session key. See ParseLinkClosePacket.
+func BuildLinkClose(linkID, signing, encryption []byte) (*Packet, error) {
+	if len(linkID) != IdentityHashLen {
+		return nil, fmt.Errorf("link_id must be %d bytes", IdentityHashLen)
+	}
+	ciphertext, err := LinkTokenEncrypt(linkID, signing, encryption)
+	if err != nil {
+		return nil, fmt.Errorf("linkclose encrypt: %w", err)
+	}
+	return &Packet{
+		HeaderType:      HeaderType1,
+		ContextFlag:     false,
+		TransportType:   BroadcastTransport,
+		DestinationType: DestinationLink,
+		PacketType:      PacketData,
+		Hops:            0,
+		DestHash:        linkID,
+		Context:         ContextLinkClose,
+		Data:            ciphertext,
+	}, nil
+}
+
+// ParseLinkClosePacket decrypts a §6.7.3 LINKCLOSE and checks its body
+// against the link it claims to close.
+//
+// That check is the whole security of this packet type, and upstream
+// performs it too (RNS/Link.py:674-683, `if plaintext == self.link_id`).
+// A LINKCLOSE is addressed to the link_id in cleartext, so without the
+// encrypted-body check any observer who has seen a single packet on a
+// link could tear it down at will — a trivial denial of service against
+// every link they can see.
+func ParseLinkClosePacket(p *Packet, linkID, signing, encryption []byte) error {
+	if p == nil {
+		return errors.New("nil packet")
+	}
+	if p.PacketType != PacketData {
+		return fmt.Errorf("packet_type %d is not DATA", p.PacketType)
+	}
+	if p.DestinationType != DestinationLink {
+		return fmt.Errorf("dest_type %d is not LINK", p.DestinationType)
+	}
+	if p.Context != ContextLinkClose {
+		return fmt.Errorf("context = 0x%02x, want 0x%02x", p.Context, ContextLinkClose)
+	}
+	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(plaintext, linkID) {
+		return errors.New("LINKCLOSE body does not match the link it was sent on")
+	}
+	return nil
 }
