@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -80,7 +81,7 @@ func TestReconnectingTCPClientSurvivesPeerDrop(t *testing.T) {
 	defer fl.close()
 
 	logger := log.New(io.Discard, "", 0)
-	rc, err := dialReconnectingTCPForTest(fl.addr(), 2*time.Second, logger, 20*time.Millisecond, 50*time.Millisecond)
+	rc, err := dialReconnectingTCPForTest(fl.addr(), 2*time.Second, logger, fastRetryPolicy())
 	if err != nil {
 		t.Fatalf("dialReconnectingTCP: %v", err)
 	}
@@ -151,7 +152,7 @@ func TestReconnectingTCPClientOuterDoneFiresOnExplicitClose(t *testing.T) {
 	defer fl.close()
 
 	logger := log.New(io.Discard, "", 0)
-	rc, err := dialReconnectingTCPForTest(fl.addr(), 2*time.Second, logger, 20*time.Millisecond, 50*time.Millisecond)
+	rc, err := dialReconnectingTCPForTest(fl.addr(), 2*time.Second, logger, fastRetryPolicy())
 	if err != nil {
 		t.Fatalf("dialReconnectingTCP: %v", err)
 	}
@@ -182,4 +183,120 @@ func readFrameWithTimeout(t *testing.T, c net.Conn, d time.Duration) []byte {
 		t.Fatalf("decode frame: %v", err)
 	}
 	return f
+}
+
+// refusingListener accepts every connection and closes it immediately,
+// which is how a peer that has denylisted our address behaves: the TCP
+// handshake completes, then the socket shuts before a byte is exchanged.
+type refusingListener struct {
+	ln      net.Listener
+	accepts chan time.Time
+}
+
+func newRefusingListener(t *testing.T) *refusingListener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	f := &refusingListener{ln: ln, accepts: make(chan time.Time, 64)}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case f.accepts <- time.Now():
+			default:
+			}
+			c.Close()
+		}
+	}()
+	return f
+}
+
+func (f *refusingListener) addr() string { return f.ln.Addr().String() }
+func (f *refusingListener) close()       { f.ln.Close() }
+
+// TestReconnectingTCPClientBacksOffFromARefusingPeer is the regression
+// test for the reconnect storm that plausibly earned an operator's
+// address a denylisting upstream.
+//
+// The old supervisor re-initialised its backoff at the top of every
+// disconnect cycle, so the exponential ramp only applied to consecutive
+// *dial failures*. Against this listener the dial always succeeds, so
+// the ramp never advanced: a redial every initialBackoff, forever.
+//
+// The assertion is on elapsed time rather than the individual gaps,
+// because scheduling noise can only ever make a gap longer — so a loaded
+// runner cannot turn a passing run into a failure, only the absence of a
+// ramp can.
+func TestReconnectingTCPClientBacksOffFromARefusingPeer(t *testing.T) {
+	fl := newRefusingListener(t)
+	defer fl.close()
+
+	policy := fastRetryPolicy()
+	logs := &syncBuffer{}
+	rc, err := dialReconnectingTCPForTest(fl.addr(), 2*time.Second, log.New(logs, "", 0), policy)
+	if err != nil {
+		t.Fatalf("dialReconnectingTCP: %v", err)
+	}
+	defer rc.Close()
+
+	// The initial dial plus four supervised redials: the ramp should be
+	// at 20, 40, 80 and 160ms, so ~300ms before jitter. A flat ramp at
+	// the floor would deliver the same five accepts in ~80ms.
+	const want = 5
+	var times []time.Time
+	for len(times) < want {
+		select {
+		case ts := <-fl.accepts:
+			times = append(times, ts)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d reconnect attempts arrived", len(times), want)
+		}
+	}
+
+	elapsed := times[len(times)-1].Sub(times[0])
+	floor := 4 * policy.connectFailFloor // what a non-climbing ramp would cost
+	if elapsed <= 2*floor {
+		t.Fatalf("%d attempts in %v — the connect ramp is not climbing "+
+			"(a flat ramp at the %v floor would take ~%v)",
+			want, elapsed, policy.connectFailFloor, floor)
+	}
+
+	// Assert the classification directly rather than only inferring it
+	// from the timing: this is the line the bug was on, and a log check
+	// cannot be knocked over by a slow runner.
+	if !strings.Contains(logs.String(), "treating as a refusal") {
+		t.Fatalf("supervisor did not classify accepted-then-closed as a refusal; log:\n%s", logs.String())
+	}
+
+	// A refusing peer must never look like a closed interface: Transport
+	// keeps the interface and the supervisor keeps trying, just slowly.
+	select {
+	case <-rc.Done():
+		t.Fatal("outer Done() fired on a refusing peer; should only fire on explicit Close()")
+	default:
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read from the test goroutine
+// while the supervisor writes to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

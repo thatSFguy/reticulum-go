@@ -27,8 +27,7 @@ type ReconnectingTCPClient struct {
 	addr        string
 	dialTimeout time.Duration
 	logger      Logger
-	initialBackoff time.Duration
-	maxBackoff     time.Duration
+	policy      retryPolicy
 
 	mu  sync.RWMutex
 	cur *TCPClient // nil during the reconnect window
@@ -39,9 +38,6 @@ type ReconnectingTCPClient struct {
 }
 
 const (
-	defaultReconnectInitialBackoff = 1 * time.Second
-	defaultReconnectMaxBackoff     = 60 * time.Second
-
 	// tcpKeepAlivePeriod sets the SO_KEEPALIVE probe interval on dialed
 	// TCP sockets. Without this, a silent peer drop (no FIN, no RST —
 	// classic NAT idle eviction) sits undetected until the next local
@@ -54,24 +50,23 @@ const (
 // misconfigured address fails service startup fast — then spawns a
 // supervisor that handles every subsequent reconnect transparently.
 func DialReconnectingTCP(addr string, dialTimeout time.Duration, logger Logger) (*ReconnectingTCPClient, error) {
-	return dialReconnectingTCPForTest(addr, dialTimeout, logger, defaultReconnectInitialBackoff, defaultReconnectMaxBackoff)
+	return dialReconnectingTCPForTest(addr, dialTimeout, logger, defaultRetryPolicy())
 }
 
 // dialReconnectingTCPForTest is the testable form: same as
-// DialReconnectingTCP but lets tests pick a much smaller backoff so
-// reconnect tests run in milliseconds instead of seconds.
-func dialReconnectingTCPForTest(addr string, dialTimeout time.Duration, logger Logger, initialBackoff, maxBackoff time.Duration) (*ReconnectingTCPClient, error) {
+// DialReconnectingTCP but lets tests supply a scaled-down policy so
+// reconnect tests run in milliseconds instead of minutes.
+func dialReconnectingTCPForTest(addr string, dialTimeout time.Duration, logger Logger, policy retryPolicy) (*ReconnectingTCPClient, error) {
 	if logger == nil {
 		logger = noopLogger{}
 	}
 	r := &ReconnectingTCPClient{
-		addr:           addr,
-		dialTimeout:    dialTimeout,
-		logger:         logger,
-		initialBackoff: initialBackoff,
-		maxBackoff:     maxBackoff,
-		inbox:          make(chan []byte, 64),
-		done:           make(chan struct{}),
+		addr:        addr,
+		dialTimeout: dialTimeout,
+		logger:      logger,
+		policy:      policy,
+		inbox:       make(chan []byte, 64),
+		done:        make(chan struct{}),
 	}
 	inner, err := r.dial()
 	if err != nil {
@@ -98,12 +93,22 @@ func (r *ReconnectingTCPClient) dial() (*TCPClient, error) {
 	return NewTCPClient(conn), nil
 }
 
-// supervise is the lifecycle owner. It pumps the inner client's inbox
-// to the outer inbox until the inner client disconnects, then redials
-// with capped exponential backoff until either the dial succeeds or
-// Close() is called.
+// supervise is the lifecycle owner. It pumps the inner client's inbox to
+// the outer inbox until the inner client disconnects, then redials under
+// retryPolicy until either a connection lands or Close() is called.
+//
+// One policy decision is made per failed attempt: the first uses the
+// attachment's measured lifetime, and each dial that never lands after
+// that is a connect failure with no lifetime at all. The ramps live
+// across attempts — this loop must not re-initialise them per cycle,
+// which is precisely the bug that made a refusing peer see a redial
+// every second forever.
 func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 	inner := initial
+	connectedAt := time.Now()
+	readBackoff := r.policy.readFailFloor
+	connectBackoff := r.policy.connectFailFloor
+
 	for {
 		r.pump(inner)
 		if r.closed.Load() {
@@ -118,37 +123,47 @@ func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 		r.mu.Unlock()
 		_ = inner.Close()
 
-		r.logger.Printf("tcp interface %s disconnected: %v — reconnecting", r.addr, inner.Err())
+		survived := time.Since(connectedAt)
+		r.logger.Printf("tcp interface %s disconnected after %v: %v — reconnecting",
+			r.addr, survived.Round(time.Millisecond), inner.Err())
 
-		backoff := r.initialBackoff
-		var next *TCPClient
+		lifetime := &survived
 		for {
 			if r.closed.Load() {
 				return
 			}
+
+			plan := r.policy.decide(lifetime, readBackoff, connectBackoff)
+			if lifetime != nil && !plan.wasReadFailure {
+				r.logger.Printf("tcp interface %s accepted then closed us after %v — "+
+					"treating as a refusal, not a dropped session",
+					r.addr, survived.Round(time.Millisecond))
+			}
+			readBackoff, connectBackoff = plan.nextReadFailBackoff, plan.nextConnectFailBackoff
+
+			wait := jitter(plan.delayBase)
 			select {
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			case <-r.done:
 				return
 			}
-			n, err := r.dial()
+
+			next, err := r.dial()
 			if err != nil {
-				r.logger.Printf("tcp reconnect %s: %v — retrying in %v", r.addr, err, backoff)
-				backoff *= 2
-				if backoff > r.maxBackoff {
-					backoff = r.maxBackoff
-				}
+				r.logger.Printf("tcp reconnect %s: %v — retrying in ~%v",
+					r.addr, err, connectBackoff.Round(time.Second))
+				lifetime = nil
 				continue
 			}
-			next = n
+
+			r.mu.Lock()
+			r.cur = next
+			r.mu.Unlock()
+			r.logger.Printf("tcp interface %s reconnected", r.addr)
+			inner = next
+			connectedAt = time.Now()
 			break
 		}
-
-		r.mu.Lock()
-		r.cur = next
-		r.mu.Unlock()
-		r.logger.Printf("tcp interface %s reconnected", r.addr)
-		inner = next
 	}
 }
 
@@ -194,8 +209,8 @@ func (r *ReconnectingTCPClient) Send(packet []byte) error {
 	return nil
 }
 
-func (r *ReconnectingTCPClient) Inbox() <-chan []byte    { return r.inbox }
-func (r *ReconnectingTCPClient) Done() <-chan struct{}   { return r.done }
+func (r *ReconnectingTCPClient) Inbox() <-chan []byte  { return r.inbox }
+func (r *ReconnectingTCPClient) Done() <-chan struct{} { return r.done }
 
 // Close shuts the wrapper down: stops the supervisor, closes the inner
 // client if any, and fires the outer Done(). Idempotent.

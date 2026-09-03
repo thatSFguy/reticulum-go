@@ -79,7 +79,7 @@ go test ./rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=1m
 | REQUEST/RESPONSE RPC (§11) | `rns/request.go`, `rns/request_dispatch.go` |
 | Channel + stream framing (§6.8) | `rns/channel.go` |
 | Propagation retrieval — client `/get` (§5.8.3) | `lxmf/retrieve.go` |
-| HDLC framing + TCP interfaces (§8.2) | `rns/hdlc.go`, `rns/tcp.go` (client), `rns/tcp_server.go` (server), `rns/tcp_reconnect.go` |
+| HDLC framing + TCP interfaces (§8.2) | `rns/hdlc.go`, `rns/tcp.go` (client), `rns/tcp_server.go` (server), `rns/tcp_reconnect.go`, `rns/tcp_retry_policy.go` (reconnect backoff) |
 | KISS framing + RNode air frames (§8.1, §8.3) | `rns/kiss.go`, `rns/rnode.go` |
 | AutoInterface discovery (mirrored from upstream) | `rns/autointerface.go` |
 | Hostile-msgpack guard | `rns/msgpack_guard.go` (+ fuzz target) |
