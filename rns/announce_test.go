@@ -429,3 +429,52 @@ func TestBuildAnnounceRejectsOverMTUAppData(t *testing.T) {
 		t.Errorf("BuildAnnounce with %d-byte app_data = nil error, want refusal", maxAppData+1)
 	}
 }
+
+// SPEC §4.6: app_data is opaque bytes to RNS, and the §4.3 msgpack
+// array is LXMF's own convention. A promiscuous listener sees announces
+// on other aspects whose app_data is not msgpack at all, and the shape
+// does not identify the protocol — so the display_name lookup must key
+// on name_hash. These are the three dispatch outcomes §4.6 tabulates,
+// as CBOR payloads (verified upstream by tools/verify_app_data_dispatch.py):
+// two of them look like success, which is what makes shape-dispatch unsafe.
+func TestLXMFDisplayNameIsKeyedOnNameHashNotShape(t *testing.T) {
+	rrcHub := NameHash(FullName("rrc", "hub"))
+	for _, c := range []struct {
+		name    string
+		appData []byte
+		// what the unkeyed decoder makes of it — the trap §4.6 warns about
+		unkeyed string
+	}{
+		{"CBOR 3-entry map (0xa3), not UTF-8 decodable", []byte{0xa3, 0x01, 0x02}, "\xa3\x01\x02"},
+		{"CBOR 7-char text string glues the header on", append([]byte{0x67}, "hubname"...), "ghubname"},
+		{"CBOR 16-item array lands in msgpack fixarray(0)", []byte{0x90}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := &Announce{NameHash: rrcHub, AppData: c.appData}
+			if got := LXMFDisplayNameFromAnnounce(a); got != nil {
+				t.Errorf("display name %q read off a non-LXMF announce; want nil", got)
+			}
+			// Lock in that the unkeyed decoder really does return
+			// confident nonsense here, so the gate above is load-bearing
+			// and not a no-op someone can inline away.
+			raw, _ := DecodeLXMFAppDataDisplayName(c.appData)
+			if string(raw) != c.unkeyed {
+				t.Errorf("unkeyed decode = %q, want %q — §4.6's dispatch table has moved", raw, c.unkeyed)
+			}
+		})
+	}
+
+	// The same app_data on the lxmf.delivery aspect still resolves.
+	want := []byte("alice")
+	appData, err := EncodeLXMFAppData(want, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &Announce{NameHash: NameHash(FullName("lxmf", "delivery")), AppData: appData}
+	if got := LXMFDisplayNameFromAnnounce(a); !bytes.Equal(got, want) {
+		t.Errorf("display name = %q, want %q", got, want)
+	}
+	if got := LXMFDisplayNameFromAnnounce(nil); got != nil {
+		t.Errorf("nil announce = %q, want nil", got)
+	}
+}
