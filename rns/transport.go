@@ -776,12 +776,15 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
 
+	// Keyed on name_hash, not on the shape of app_data (SPEC §4.6): we
+	// listen promiscuously, so most announces here are not LXMF at all
+	// and their app_data decodes to a convincing wrong name.
 	switch {
 	case wasNewIdentity:
-		displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+		displayName := LXMFDisplayNameFromAnnounce(a)
 		t.logger.Printf("announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
 	case now.Sub(prevLastSeen) >= AnnounceLogReturnThreshold:
-		displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+		displayName := LXMFDisplayNameFromAnnounce(a)
 		t.logger.Printf("announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
 	}
 	for _, h := range handlers {

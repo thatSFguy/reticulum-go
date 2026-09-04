@@ -1,6 +1,7 @@
 package rns
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -299,7 +300,16 @@ func EncodeLXMFAppData(displayName []byte, stampCost *int) ([]byte, error) {
 }
 
 // DecodeLXMFAppDataDisplayName extracts the display_name from an LXMF
-// announce app_data. Tolerant of:
+// announce app_data.
+//
+// Only call this once you KNOW the announce is on the lxmf.delivery
+// aspect — prefer LXMFDisplayNameFromAnnounce, which checks. SPEC §4.6:
+// app_data is opaque bytes to RNS and its shape does not tell you which
+// protocol produced it, so this function cannot and does not report
+// "that was not LXMF". Fed a non-LXMF payload it returns confident
+// nonsense, exactly as upstream's display_name_from_app_data does.
+//
+// Tolerant of:
 //   - 1-element msgpack array [bin]
 //   - 2-element msgpack array [bin, stamp_cost]
 //   - 3-element msgpack array [bin, stamp_cost, capability_flags]
@@ -312,7 +322,16 @@ func DecodeLXMFAppDataDisplayName(data []byte) ([]byte, error) {
 	}
 	// Try msgpack array first.
 	var arr []msgpack.RawMessage
-	if err := safeUnmarshalAnnounce(data, &arr); err == nil && len(arr) >= 1 {
+	if err := safeUnmarshalAnnounce(data, &arr); err == nil {
+		if len(arr) == 0 {
+			// A well-formed but EMPTY array carries no name. Falling
+			// through to the legacy branch here would hand back the
+			// 0x90 fixarray framing byte as though it were the name;
+			// upstream's msgpack branch returns None. No legitimate
+			// legacy name can reach this, since 0x90-0x9f and 0xdc are
+			// not valid UTF-8 lead bytes. SPEC §4.6.
+			return nil, nil
+		}
 		var name []byte
 		// Element 0 may be bin (preferred) or str.
 		if uerr := safeUnmarshalAnnounce(arr[0], &name); uerr == nil {
@@ -326,6 +345,36 @@ func DecodeLXMFAppDataDisplayName(data []byte) ([]byte, error) {
 	}
 	// Fall back to legacy raw-UTF8 form.
 	return data, nil
+}
+
+// lxmfDeliveryNameHash is NameHash("lxmf.delivery"), the well-known
+// 6ec60bc318e2c0f0d908 (SPEC §1.2).
+var lxmfDeliveryNameHash = NameHash(FullName("lxmf", "delivery"))
+
+// LXMFDisplayNameFromAnnounce returns the display_name an announce
+// carries, and nil for any announce that is not on the lxmf.delivery
+// aspect. This is the safe way to label an announce on a promiscuous
+// listener, which sees every aspect on the mesh.
+//
+// SPEC §4.6: the msgpack `[name, stamp_cost, [flags]]` array of §4.3 is
+// LXMF's convention for its own destinations, not an RNS rule — to RNS
+// app_data is opaque bytes that Destination.announce appends unexamined,
+// and other application protocols encode it however their own specs say.
+// Key the parser on name_hash (§4.4), NEVER on the shape of the bytes:
+// the shape does not tell you, and asking it does not fail loudly.
+// Upstream's display_name_from_app_data dispatches on the first byte
+// alone, and two of its three non-LXMF outcomes look like success — a
+// CBOR text string comes back as a name with the length header glued on
+// as a character (`67 "hubname"` reads as "ghubname"), and a CBOR
+// 16-item array leads with 0x90, lands in msgpack's fixarray range and
+// returns "no name at all". Verified by the spec repo's
+// tools/verify_app_data_dispatch.py.
+func LXMFDisplayNameFromAnnounce(a *Announce) []byte {
+	if a == nil || !bytes.Equal(a.NameHash, lxmfDeliveryNameHash) {
+		return nil
+	}
+	name, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+	return name
 }
 
 // DecodeLXMFAppDataStampCost extracts the stamp_cost an LXMF delivery
