@@ -115,29 +115,43 @@ func TestValidateStampRejects(t *testing.T) {
 // the sender never used, so every genuine stamp would be rejected —
 // and a self-round-trip would not notice, because both sides would be
 // wrong together.
+//
+// The negative half is statistical, for the same reason as the
+// tamper case above: SHA256(wbBad || stamp) is uniform, so a stamp
+// ground against the stripped id still clears testStampCost bits
+// against the wrong workblock once every 2^cost messages — 1 in 64
+// here, which flaked CI twice. A single coincidence proves nothing,
+// so draw a fresh message and look again. A real regression, where
+// validation derives the id from the 5-element payload, collides on
+// EVERY attempt rather than one in sixty-four.
 func TestValidateStampUsesTheStrippedMessageID(t *testing.T) {
-	m, _ := stampedMessage(t, testStampCost)
+	const attempts = 8 // spurious failure rate 64^-8
+	for i := 0; i < attempts; i++ {
+		m, _ := stampedMessage(t, testStampCost)
 
-	stripped := m.MessageID()
-	wbGood, err := stampWorkblock(stripped, workblockExpandRounds)
-	if err != nil {
-		t.Fatal(err)
+		stripped := m.MessageID()
+		wbGood, err := stampWorkblock(stripped, workblockExpandRounds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stampValid(m.Stamp, testStampCost, wbGood) {
+			t.Fatal("stamp does not validate against the stripped message_id")
+		}
+		// The 5-element raw payload must NOT produce a working workblock.
+		rawID := ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
+		if bytes.Equal(rawID, stripped) {
+			t.Skip("payload was not stamped; nothing to distinguish")
+		}
+		wbBad, err := stampWorkblock(rawID, workblockExpandRounds)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !stampValid(m.Stamp, testStampCost, wbBad) {
+			return // the two ids are distinguishable, as required
+		}
 	}
-	if !stampValid(m.Stamp, testStampCost, wbGood) {
-		t.Fatal("stamp does not validate against the stripped message_id")
-	}
-	// The 5-element raw payload must NOT produce a working workblock.
-	rawID := ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
-	if bytes.Equal(rawID, stripped) {
-		t.Skip("payload was not stamped; nothing to distinguish")
-	}
-	wbBad, err := stampWorkblock(rawID, workblockExpandRounds)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stampValid(m.Stamp, testStampCost, wbBad) {
-		t.Error("stamp validated against the stamp-inclusive id; the two ids are not distinguishable")
-	}
+	t.Errorf("stamp validated against the stamp-inclusive id on all %d attempts; "+
+		"validation is not using the stripped message_id", attempts)
 }
 
 // End to end through the receive path: with a cost set we score every
