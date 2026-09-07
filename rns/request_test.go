@@ -345,3 +345,75 @@ func TestRPCResourceAdvertisementIsLabelled(t *testing.T) {
 		t.Errorf("plain Resource is labelled as RPC: q=%x flags=%#x", plainAdv.RequestID, plainAdv.Flags)
 	}
 }
+
+// TestServingRequestsKeepsTheLinkAlive is the regression for a link that
+// was torn down while in active use.
+//
+// handleLinkData consumes ContextRequest in its own switch and returns
+// before HandleLinkData, which was the only inbound path that refreshed
+// Link.LastActivity. Serving a request therefore did not count as
+// activity, and sweepLinks closed the link 15 minutes after it was
+// established no matter how many requests crossed it. A NomadNet page
+// server carries nothing but these packets, so its links died
+// mid-session, every session.
+func TestServingRequestsKeepsTheLinkAlive(t *testing.T) {
+	link, tp, iface := makeActiveTestLink(t)
+	rd := reader(iface)
+
+	if err := tp.RegisterRequestHandler("/page/play.mu", AllowAll, nil,
+		func(*RequestContext) (any, error) { return "board", nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	// A link on the brink: idle long enough that the next sweep closes
+	// it, which is where a busy link kept ending up.
+	tp.SetLinkLifetime(30*time.Second, time.Minute, time.Minute)
+	stale := time.Now().Add(-59 * time.Second)
+	link.mu.Lock()
+	link.LastActivity = stale
+	link.mu.Unlock()
+
+	if _, err := tp.SendRequest(link.ID, "/page/play.mu", nil); err != nil {
+		t.Fatalf("SendRequest: %v", err)
+	}
+	deliverToSelf(t, tp, rd.take(t))
+
+	link.mu.Lock()
+	after := link.LastActivity
+	link.mu.Unlock()
+	if !after.After(stale) {
+		t.Fatalf("serving a request left LastActivity at %v — a busy link still looks idle", after)
+	}
+
+	// And the sweep must now leave it alone.
+	var closed int
+	tp.linkManager.SetLinkClosedHandler(func([]byte, byte) { closed++ })
+	tp.sweepLinks()
+	if closed != 0 {
+		t.Errorf("the sweep closed a link that just served a request (%d teardowns)", closed)
+	}
+}
+
+// The same guarantee for the §10 Resource path: a page body large enough
+// to need a Resource is answered with resource-control traffic, which
+// also bypasses HandleLinkData.
+func TestResourceControlTrafficKeepsTheLinkAlive(t *testing.T) {
+	link, _, _ := makeActiveTestLink(t)
+
+	stale := time.Now().Add(-59 * time.Second)
+	link.mu.Lock()
+	link.LastActivity = stale
+	link.mu.Unlock()
+
+	link.NoteInboundTraffic()
+
+	link.mu.Lock()
+	after, auth := link.LastActivity, link.authenticated
+	link.mu.Unlock()
+	if !after.After(stale) {
+		t.Errorf("NoteInboundTraffic did not refresh the idle timer")
+	}
+	if !auth {
+		t.Errorf("NoteInboundTraffic did not mark the link authenticated")
+	}
+}

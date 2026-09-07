@@ -150,6 +150,10 @@ func (t *Transport) handleRequest(p *Packet) {
 		t.logger.Printf("request decrypt: %v", err)
 		return
 	}
+	// The peer just proved it holds the session keys, so this counts as
+	// activity for the idle sweep. Without it a link serving requests
+	// and nothing else is torn down mid-session — see NoteInboundTraffic.
+	l.NoteInboundTraffic()
 	requestID, err := RequestIDFromPacket(p)
 	if err != nil {
 		t.logger.Printf("request id: %v", err)
@@ -265,6 +269,7 @@ func (t *Transport) handleResponse(p *Packet) {
 		t.logger.Printf("response decrypt: %v", err)
 		return
 	}
+	l.NoteInboundTraffic()
 	requestID, response, err := ParseResponse(plaintext)
 	if err != nil {
 		t.logger.Printf("response parse: %v", err)

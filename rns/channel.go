@@ -301,6 +301,7 @@ func (t *Transport) handleChannel(p *Packet) {
 		t.logger.Printf("channel decrypt: %v", err)
 		return
 	}
+	l.NoteInboundTraffic()
 	m, err := ParseChannelMessage(plaintext)
 	if err != nil {
 		t.logger.Printf("channel parse: %v", err)

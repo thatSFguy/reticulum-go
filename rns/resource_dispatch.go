@@ -46,8 +46,10 @@ func (t *Transport) handleResourceControl(p *Packet) {
 	// keys — same authentication signal as an inbound link DATA packet.
 	// Resource transfers never touch HandleLinkData, so without this a
 	// link used only for Resource traffic would look unauthenticated
-	// and its keepalives would be ignored (see Link.authenticated).
-	link.MarkAuthenticated()
+	// and its keepalives would be ignored (see Link.authenticated) —
+	// and, until NoteInboundTraffic, would also never refresh its idle
+	// timer despite carrying every byte of a page body.
+	link.NoteInboundTraffic()
 
 	switch p.Context {
 	case ContextResourceADV:

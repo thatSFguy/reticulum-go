@@ -158,6 +158,35 @@ func (l *Link) MarkAuthenticated() {
 	l.mu.Unlock()
 }
 
+// NoteInboundTraffic records authenticated traffic from the peer: it
+// marks the link authenticated AND refreshes the idle timer.
+//
+// A successful link-layer decrypt is the signal for both. It proves the
+// peer holds the session keys, which is what authenticates the link,
+// and it is by definition the peer doing something, which is what the
+// idle sweep is asking about.
+//
+// WHY THIS EXISTS: handleLinkData consumes the §11 REQUEST/RESPONSE,
+// §6.8 CHANNEL and §10 Resource-control contexts in its own switch and
+// returns before reaching HandleLinkData — which was the only inbound
+// path that refreshed LastActivity. So a node whose entire traffic
+// profile is those contexts looked permanently idle no matter how busy
+// it was, and Transport.sweepLinks tore its links down 15 minutes after
+// establishment, mid-session.
+//
+// That is not a corner case: it is exactly a NomadNet page server,
+// where every request is §11.1 and every page body is a §10 Resource.
+// Such a link survived only as long as the peer's KEEPALIVEs happened
+// to refresh it, so an idle browser held a link for hours while an
+// actively used one was reliably killed at the 15-minute mark — the
+// busier the link, the sooner it died.
+func (l *Link) NoteInboundTraffic() {
+	l.mu.Lock()
+	l.authenticated = true
+	l.LastActivity = time.Now()
+	l.mu.Unlock()
+}
+
 // RemoteIdentity returns the peer's 64-byte public key if they have
 // identified over §6.7.6, or nil. Mirrors upstream's
 // Link.get_remote_identity().
