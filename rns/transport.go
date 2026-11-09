@@ -297,6 +297,17 @@ func (t *Transport) LinkManager() *LinkManager { return t.linkManager }
 // Returns nil silently when a request was suppressed by dedup; the caller
 // should treat this method as fire-and-forget.
 func (t *Transport) RequestPath(targetDestHash []byte) error {
+	return t.RequestPathAfter(targetDestHash, PathRequestDedupWindow)
+}
+
+// RequestPathAfter is RequestPath for a caller that cannot wait out the
+// default window: the request is suppressed only if one for this target went
+// out less than minInterval ago. minInterval should not exceed
+// PathRequestDedupWindow, after which the record of a request is swept.
+//
+// Each request carries a fresh random tag, so relays do not discard a repeat
+// as a duplicate (SPEC §7.2.2).
+func (t *Transport) RequestPathAfter(targetDestHash []byte, minInterval time.Duration) error {
 	if len(targetDestHash) != IdentityHashLen {
 		return fmt.Errorf("target dest_hash must be %d bytes", IdentityHashLen)
 	}
@@ -313,7 +324,7 @@ func (t *Transport) RequestPath(targetDestHash []byte) error {
 			delete(t.pathRequestsSent, k)
 		}
 	}
-	if last, ok := t.pathRequestsSent[key]; ok && now.Sub(last) < PathRequestDedupWindow {
+	if last, ok := t.pathRequestsSent[key]; ok && now.Sub(last) < minInterval {
 		t.mu.Unlock()
 		return nil
 	}
@@ -354,12 +365,22 @@ func (t *Transport) RegisterAnnounceHandler(h AnnounceHandler) {
 	t.announceHandlers = append(t.announceHandlers, h)
 }
 
-// Recall returns the cached KnownIdentity for a destination hash, or
-// nil if we've never heard them announce.
+// Recall returns a snapshot of the cached KnownIdentity for a destination
+// hash, or nil if we've never heard them announce.
+//
+// A snapshot because handleAnnounce updates the cached entry in place under
+// t.mu, and callers read the result without it, often from other goroutines.
+// A shallow copy is enough: every slice field is replaced on update, never
+// written through.
 func (t *Transport) Recall(destHash []byte) *KnownIdentity {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.known[hex.EncodeToString(destHash)]
+	k := t.known[hex.EncodeToString(destHash)]
+	if k == nil {
+		return nil
+	}
+	cp := *k
+	return &cp
 }
 
 // Restore inserts a previously-verified KnownIdentity into the cache —

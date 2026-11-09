@@ -219,6 +219,77 @@ func TestTransportBroadcastFansOut(t *testing.T) {
 	}
 }
 
+func TestRequestPathAfterHonoursItsInterval(t *testing.T) {
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+	target := newDummyHash(0x56)
+	const interval = 40 * time.Millisecond
+
+	for i := 0; i < 2; i++ {
+		if err := tr.RequestPathAfter(target, interval); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(iface.sentCopy()); n != 1 {
+		t.Fatalf("%d requests inside the interval, want 1", n)
+	}
+	time.Sleep(2 * interval)
+	if err := tr.RequestPathAfter(target, interval); err != nil {
+		t.Fatal(err)
+	}
+	sent := iface.sentCopy()
+	if len(sent) != 2 {
+		t.Fatalf("%d requests after the interval, want 2", len(sent))
+	}
+	// SPEC §7.2.2: relays drop a repeated destination+tag, so a retry that
+	// reused its tag would never be answered.
+	if bytes.Equal(sent[0], sent[1]) {
+		t.Fatal("retry reused the first request's tag")
+	}
+	if err := tr.RequestPath(target); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(iface.sentCopy()); n != 2 {
+		t.Fatal("RequestPath must keep its own longer window")
+	}
+}
+
+func TestRecallReturnsASnapshot(t *testing.T) {
+	id, _ := NewIdentity()
+	tr := NewTransport(nil)
+	announce := func() {
+		t.Helper()
+		pkt, err := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := pkt.Pack()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParsePacket(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr.handleAnnounce(parsed)
+	}
+	announce()
+	dest := id.DestinationHashFor(FullName("lxmf", "delivery"))
+	snapshot := tr.Recall(dest)
+	if snapshot == nil {
+		t.Fatal("announce was not cached")
+	}
+	before := append([]byte(nil), snapshot.LastRandom...)
+	announce()
+	if !bytes.Equal(snapshot.LastRandom, before) {
+		t.Fatal("a later announce changed an identity already returned by Recall")
+	}
+	if bytes.Equal(tr.Recall(dest).LastRandom, before) {
+		t.Fatal("the cache did not take the later announce")
+	}
+}
+
 func TestRequestPathBroadcastsAndDedups(t *testing.T) {
 	iface := newFakeInterface()
 	tr := NewTransport(nil)
