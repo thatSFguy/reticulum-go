@@ -559,7 +559,7 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 		d.holdUnknownSender(msg, len(plain), "")
 		return
 	}
-	d.verifyAndDispatch(msg, sender, "")
+	d.verifyAndDispatch(msg, sender, "", d.validateInboundStamp)
 }
 
 // handleInboundLinkPlaintext is invoked by the Transport when a link
@@ -607,7 +607,7 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 		d.holdUnknownSender(owned, len(plaintext), "link ")
 		return
 	}
-	d.verifyAndDispatch(msg, sender, "link ")
+	d.verifyAndDispatch(msg, sender, "link ", d.validateInboundStamp)
 }
 
 // verifyAndDispatch finishes an inbound message once the sender's key is
@@ -619,13 +619,16 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 // remembering a ticket from one lets anybody grant themselves free delivery
 // in our name. Before v0.6.1 the link path skipped both, so a sender could
 // bypass stamp enforcement just by opening a Link.
-func (d *Delivery) verifyAndDispatch(msg *Message, sender *rns.KnownIdentity, label string) {
+//
+// validateStamp is validateInboundStamp, except on the release worker: see
+// drainReleased.
+func (d *Delivery) verifyAndDispatch(msg *Message, sender *rns.KnownIdentity, label string, validateStamp func(*Message) bool) {
 	if err := msg.Verify(sender.Ed25519Public()); err != nil {
 		d.errorf("%sLXMF verify: %w", label, err)
 		return
 	}
 	d.rememberInboundTicket(msg)
-	if !d.validateInboundStamp(msg) {
+	if !validateStamp(msg) {
 		return
 	}
 	d.dispatchInbound(msg)

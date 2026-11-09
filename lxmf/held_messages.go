@@ -32,6 +32,13 @@ const (
 
 	// MaxHeldBytes caps the total size of held message bodies.
 	MaxHeldBytes = 2 << 20
+
+	// HeldPathRetryInterval is how long a held message waits before asking
+	// for its sender's path again, and the minimum gap between requests for
+	// one sender while messages are held. It matches upstream's
+	// PATH_REQUEST_MI, the shortest interval at which RNS repeats a path
+	// request itself, and leaves one retry inside HeldMessageTTL.
+	HeldPathRetryInterval = 20 * time.Second
 )
 
 type heldMessage struct {
@@ -39,6 +46,7 @@ type heldMessage struct {
 	label  string // log prefix: "" for opportunistic, "link " for direct
 	size   int
 	heldAt time.Time
+	known  *rns.KnownIdentity // set on release
 }
 
 type holdResult int
@@ -52,9 +60,12 @@ const (
 type heldMessages struct {
 	mu       sync.Mutex
 	bySender map[string][]heldMessage
-	count    int
-	bytes    int
+	ready    []heldMessage // released, waiting for the release worker
+	draining bool          // a release worker is running
+	count    int           // includes ready
+	bytes    int           // includes ready
 	ttl      time.Duration
+	retry    time.Duration
 	now      func() time.Time
 }
 
@@ -62,6 +73,7 @@ func newHeldMessages() *heldMessages {
 	return &heldMessages{
 		bySender: make(map[string][]heldMessage),
 		ttl:      HeldMessageTTL,
+		retry:    HeldPathRetryInterval,
 		now:      time.Now,
 	}
 }
@@ -71,6 +83,8 @@ func (h *heldMessages) add(msg *Message, size int, label string) holdResult {
 	defer h.mu.Unlock()
 	key := hex.EncodeToString(msg.SourceHash)
 	queue := h.bySender[key]
+	// DedupKey is only trustworthy after Verify, but a forged twin would
+	// need the signature of a message that travels encrypted to us.
 	dedup := msg.DedupKey()
 	for _, held := range queue {
 		if dedup != nil && bytes.Equal(held.msg.DedupKey(), dedup) {
@@ -88,21 +102,58 @@ func (h *heldMessages) add(msg *Message, size int, label string) holdResult {
 	return holdAdded
 }
 
-// take removes and returns everything held for sender.
-func (h *heldMessages) take(sender []byte) []heldMessage {
+// release moves everything held for sender onto the ready queue and reports
+// whether the caller must start a worker to drain it. Released messages stay
+// counted against the caps until next hands them out: verifying one can take
+// far longer than an announce takes to arrive, so without that the queue
+// would be unbounded.
+func (h *heldMessages) release(sender []byte, known *rns.KnownIdentity) (startWorker bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	key := hex.EncodeToString(sender)
 	queue := h.bySender[key]
+	if len(queue) == 0 {
+		return false
+	}
 	delete(h.bySender, key)
 	for _, held := range queue {
-		h.count--
-		h.bytes -= held.size
+		held.known = known
+		h.ready = append(h.ready, held)
 	}
-	return queue
+	if h.draining {
+		return false
+	}
+	h.draining = true
+	return true
 }
 
-// expire removes and returns everything past its TTL.
+// waiting reports whether anything is still held for sender.
+func (h *heldMessages) waiting(sender []byte) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.bySender[hex.EncodeToString(sender)]) > 0
+}
+
+// next hands the release worker its next message. When it returns false the
+// worker must exit; a later release starts a new one.
+func (h *heldMessages) next() (heldMessage, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.ready) == 0 {
+		h.ready = nil
+		h.draining = false
+		return heldMessage{}, false
+	}
+	held := h.ready[0]
+	h.ready[0] = heldMessage{} // don't pin the body through the backing array
+	h.ready = h.ready[1:]
+	h.count--
+	h.bytes -= held.size
+	return held, true
+}
+
+// expire removes and returns everything past its TTL. Released messages are
+// not affected: their key has arrived and they are only waiting their turn.
 func (h *heldMessages) expire() []heldMessage {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -131,7 +182,8 @@ func (h *heldMessages) expire() []heldMessage {
 // holdUnknownSender keeps msg until its sender's announce arrives and asks
 // the network for that announce.
 func (d *Delivery) holdUnknownSender(msg *Message, size int, label string) {
-	switch d.held.add(msg, size, label) {
+	result := d.held.add(msg, size, label)
+	switch result {
 	case holdFull:
 		d.errorf("%ssender %x unknown — hold is full, message dropped", label, msg.SourceHash[:4])
 	case holdDuplicate:
@@ -140,13 +192,30 @@ func (d *Delivery) holdUnknownSender(msg *Message, size int, label string) {
 		d.errorf("%ssender %x unknown — holding message for its announce", label, msg.SourceHash[:4])
 		time.AfterFunc(d.held.ttl+time.Millisecond, d.expireHeld)
 	}
-	if err := d.transport.RequestPath(msg.SourceHash); err != nil {
-		d.errorf("path? request: %w", err)
+	d.requestHeldPath(msg.SourceHash)
+	if result == holdAdded {
+		// Scheduled after the request above: started any earlier, the
+		// retry would land just inside the interval and be suppressed.
+		sender := msg.SourceHash
+		time.AfterFunc(d.held.retry, func() {
+			if d.held.waiting(sender) {
+				d.requestHeldPath(sender)
+			}
+		})
 	}
 	// The announce may have landed between the caller's Recall and the
 	// add above, in which case no later announce would release this.
 	if d.transport.Recall(msg.SourceHash) != nil {
 		d.releaseHeld(msg.SourceHash)
+	}
+}
+
+// requestHeldPath asks for a held sender's path. A message can only wait
+// for HeldMessageTTL, so it can't use RequestPath's longer default window:
+// one lost request or response would outlast the message.
+func (d *Delivery) requestHeldPath(sender []byte) {
+	if err := d.transport.RequestPathAfter(sender, d.held.retry); err != nil {
+		d.errorf("path? request: %w", err)
 	}
 }
 
@@ -156,24 +225,38 @@ func (d *Delivery) expireHeld() {
 	}
 }
 
-// releaseHeld verifies and delivers whatever was waiting for sender. It
-// runs from the announce handler on the dispatcher goroutine, and stamp
-// validation is expensive, so the work moves off that goroutine; the
-// per-sender cap bounds it.
+// releaseHeld queues whatever was waiting for sender for verification and
+// delivery. It runs from the announce handler on the dispatcher goroutine,
+// and stamp validation is expensive, so the work moves off that goroutine.
+//
+// It moves to exactly one worker, never one goroutine per release. When
+// MaxConcurrentStampValidations is exhausted, validation fails OPEN even
+// under EnforceStamps (SPEC §5.7.4 policy, see validateInboundStamp).
+// Holding messages from many fresh identities and then announcing them all
+// in a burst would saturate that cap with one goroutine per release, and the
+// per-sender failure budget cannot help because each identity is new.
 func (d *Delivery) releaseHeld(sender []byte) {
-	waiting := d.held.take(sender)
-	if len(waiting) == 0 {
-		return
-	}
 	known := d.transport.Recall(sender)
 	if known == nil {
 		return
 	}
-	go func() {
-		for _, held := range waiting {
-			d.verifyAndDispatch(held.msg, known, held.label)
+	if d.held.release(sender, known) {
+		go d.drainReleased()
+	}
+}
+
+// drainReleased skips the concurrency slots because, as the only worker, it
+// adds at most one validation per Delivery. The slots are shared across the
+// process and shed fail-open, so taking one here could only let a burst of
+// releases cost some other message its check, or lose this one its own.
+func (d *Delivery) drainReleased() {
+	for {
+		held, ok := d.held.next()
+		if !ok {
+			return
 		}
-	}()
+		d.verifyAndDispatch(held.msg, held.known, held.label, d.checkInboundStamp)
+	}
 }
 
 // heldReleaseHandler releases held messages when a verified lxmf.delivery
