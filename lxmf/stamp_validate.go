@@ -101,6 +101,17 @@ func (d *Delivery) validateInboundStamp(m *Message) bool {
 		d.errorf("stamp validation skipped: %d concurrent validations already running", MaxConcurrentStampValidations)
 		return true
 	}
+	return d.checkInboundStamp(m)
+}
+
+// checkInboundStamp is validateInboundStamp without the concurrency cap, so
+// it never sheds. Only a caller that is already serial may use it directly:
+// see drainReleased.
+func (d *Delivery) checkInboundStamp(m *Message) bool {
+	cost := d.InboundStampCost
+	if cost <= 0 {
+		return true
+	}
 
 	// §5.7.3 first: a stamp matching any ticket we issued this sender is
 	// valid regardless of cost, and scores the COST_TICKET sentinel
