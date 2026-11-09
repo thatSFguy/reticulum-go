@@ -85,6 +85,9 @@ type Delivery struct {
 	// MaxConcurrentInboundHandlers.
 	inflight chan struct{}
 
+	// held keeps messages whose sender's key we don't have yet.
+	held *heldMessages
+
 	// OnError is called when an inbound packet can't be decrypted, parsed,
 	// or verified, and when an outbound send hits a peer-caused problem it
 	// can work around — today, a recipient whose announce app_data carries
@@ -196,6 +199,7 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity, buildAnnounce
 		destHash:      identity.DestinationHashFor(FullName()),
 		inflight:      make(chan struct{}, MaxConcurrentInboundHandlers),
 		stampFailures: &stampBudget{},
+		held:          newHeldMessages(),
 	}
 	if err := transport.RegisterLocal(&rns.LocalDestination{
 		DestHash:        d.destHash,
@@ -206,6 +210,7 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity, buildAnnounce
 	}); err != nil {
 		return nil, err
 	}
+	transport.RegisterAnnounceHandler(&heldReleaseHandler{d: d, nameHash: rns.NameHash(FullName())})
 	return d, nil
 }
 
@@ -548,30 +553,13 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 
 	sender := d.transport.Recall(msg.SourceHash)
 	if sender == nil {
-		d.errorf("sender %x unknown — must announce first", msg.SourceHash[:4])
-		// Ask the network for their announce. Future messages from this
-		// sender will succeed once a path-response announce arrives and
-		// populates Transport.known. The current message stays dropped —
-		// PROOF was already emitted so the mobile client won't retry it.
-		if err := d.transport.RequestPath(msg.SourceHash); err != nil {
-			d.errorf("path? request: %w", err)
-		}
+		// PROOF was already emitted, so the sender won't retry this.
+		// The body is ours, but DestHash aliases the packet.
+		msg.DestHash = append([]byte(nil), msg.DestHash...)
+		d.holdUnknownSender(msg, len(plain), "")
 		return
 	}
-	if err := msg.Verify(sender.Ed25519Public()); err != nil {
-		d.errorf("verify: %w", err)
-		return
-	}
-	// Both of these run only after the signature checks out: validating
-	// a stamp on an unauthenticated body would spend a 768 KiB workblock
-	// on whatever a stranger sent, and remembering a ticket from one
-	// would let anybody grant themselves free delivery in our name.
-	d.rememberInboundTicket(msg)
-	if !d.validateInboundStamp(msg) {
-		return
-	}
-
-	d.dispatchInbound(msg)
+	d.verifyAndDispatch(msg, sender, "")
 }
 
 // handleInboundLinkPlaintext is invoked by the Transport when a link
@@ -609,34 +597,37 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 	}
 	sender := d.transport.Recall(msg.SourceHash)
 	if sender == nil {
-		d.errorf("link sender %x unknown — must announce first", msg.SourceHash[:4])
-		if err := d.transport.RequestPath(msg.SourceHash); err != nil {
-			d.errorf("path? request: %w", err)
+		// The parsed message aliases plaintext, which belongs to the
+		// caller and has to outlive this call while the message waits.
+		owned, err := ParseDirectBody(append([]byte(nil), plaintext...))
+		if err != nil {
+			d.errorf("link LXMF parse: %w", err)
+			return
 		}
+		d.holdUnknownSender(owned, len(plaintext), "link ")
 		return
 	}
+	d.verifyAndDispatch(msg, sender, "link ")
+}
+
+// verifyAndDispatch finishes an inbound message once the sender's key is
+// known. label prefixes log lines to name the delivery path.
+//
+// Tickets and stamps (SPEC §5.7.3, §5.7.4) apply on every path, and only
+// after the signature checks out: validating a stamp on an unauthenticated
+// body spends a 768 KiB workblock on whatever a stranger sent, and
+// remembering a ticket from one lets anybody grant themselves free delivery
+// in our name. Before v0.6.1 the link path skipped both, so a sender could
+// bypass stamp enforcement just by opening a Link.
+func (d *Delivery) verifyAndDispatch(msg *Message, sender *rns.KnownIdentity, label string) {
 	if err := msg.Verify(sender.Ed25519Public()); err != nil {
-		d.errorf("link LXMF verify: %w", err)
+		d.errorf("%sLXMF verify: %w", label, err)
 		return
 	}
-	// Identical to the opportunistic path, and for the same reasons
-	// (SPEC §5.7.3, §5.7.4): both run only after the signature checks
-	// out, because validating a stamp on an unauthenticated body spends
-	// a 768 KiB workblock on whatever a stranger sent, and remembering
-	// a ticket from one lets anybody grant themselves free delivery in
-	// our name.
-	//
-	// These were missing here until v0.6.1, which made InboundStampCost,
-	// EnforceStamps and Tickets apply to single-packet messages only —
-	// so a sender bypassed stamp enforcement entirely just by opening a
-	// Link, which Send does automatically for anything over
-	// MaxOpportunisticPayload. Enforcement that a 296-byte message walks
-	// straight past is not enforcement.
 	d.rememberInboundTicket(msg)
 	if !d.validateInboundStamp(msg) {
 		return
 	}
-
 	d.dispatchInbound(msg)
 }
 
