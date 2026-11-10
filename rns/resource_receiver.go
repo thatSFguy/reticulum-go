@@ -197,11 +197,11 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 			if adv.TotalSegments > 1 {
 				whole, err := t.segments.add(link.ID, adv, body, time.Now())
 				if err != nil {
-					t.logger.Printf("resource segment %d/%d on link %x: %v", adv.SegmentIndex, adv.TotalSegments, link.ID[:4], err)
+					logAt(t.logger, LogInfo, "resource segment %d/%d on link %x: %v", adv.SegmentIndex, adv.TotalSegments, link.ID[:4], err)
 					return
 				}
 				if whole == nil {
-					t.logger.Printf("resource segment %d/%d assembled on link %x, awaiting the rest", adv.SegmentIndex, adv.TotalSegments, link.ID[:4])
+					logAt(t.logger, LogDebug, "resource segment %d/%d assembled on link %x, awaiting the rest", adv.SegmentIndex, adv.TotalSegments, link.ID[:4])
 					return
 				}
 				body = whole
@@ -288,7 +288,7 @@ func (rr *ResourceReceiver) HandlePart(partCiphertext []byte) {
 	select {
 	case rr.partCh <- append([]byte(nil), partCiphertext...):
 	default:
-		rr.logger.Printf("resource receiver: PART channel full for %s — dropping",
+		logAt(rr.logger, LogWarn, "resource receiver: PART channel full for %s — dropping",
 			ResourceHashShortHex(rr.resourceHash))
 	}
 }
@@ -299,7 +299,7 @@ func (rr *ResourceReceiver) HandleHmu(h *ResourceHmu) {
 	select {
 	case rr.hmuCh <- h:
 	default:
-		rr.logger.Printf("resource receiver: HMU channel full for %s — dropping",
+		logAt(rr.logger, LogWarn, "resource receiver: HMU channel full for %s — dropping",
 			ResourceHashShortHex(rr.resourceHash))
 	}
 }
@@ -313,7 +313,7 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 
 	// Initial request — ask for as many as fit our window.
 	if err := rr.requestNextWindow(); err != nil {
-		rr.logger.Printf("resource receiver: initial REQ: %v", err)
+		logAt(rr.logger, LogWarn, "resource receiver: initial REQ: %v", err)
 		rr.state.Store(int32(ResourceStateFailed))
 		return err
 	}
@@ -331,19 +331,19 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 	for rr.receivedCount < len(rr.parts) {
 		select {
 		case <-ctx.Done():
-			rr.logger.Printf("resource receiver: timed out link=%x resource=%s — %d/%d parts received",
+			logAt(rr.logger, LogWarn, "resource receiver: timed out link=%x resource=%s — %d/%d parts received",
 				rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), rr.receivedCount, len(rr.parts))
 			rr.state.Store(int32(ResourceStateFailed))
 			// RCL so the sender stops retransmitting instead of burning
 			// its watchdog retries — upstream ≥1.3.9 RCLs on any
 			// receiver-side abort while the link is live (SPEC §10.9).
 			if cancelErr := rr.transport.broadcastResourceCancel(rr.link, rr.resourceHash, false); cancelErr != nil {
-				rr.logger.Printf("resource receiver: RCL on timeout: %v", cancelErr)
+				logAt(rr.logger, LogWarn, "resource receiver: RCL on timeout: %v", cancelErr)
 			}
 			return ctx.Err()
 
 		case <-rr.cancelCh:
-			rr.logger.Printf("resource receiver: cancelled link=%x resource=%s — %d/%d parts received",
+			logAt(rr.logger, LogInfo, "resource receiver: cancelled link=%x resource=%s — %d/%d parts received",
 				rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), rr.receivedCount, len(rr.parts))
 			rr.state.Store(int32(ResourceStateCancelled))
 			return ErrResourceCancelled
@@ -353,7 +353,7 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 			// gaps. The receiver's overall lifetime is bounded by the
 			// caller's context, so this loops until ctx fires.
 			if err := rr.requestNextWindow(); err != nil {
-				rr.logger.Printf("resource receiver: re-REQ: %v", err)
+				logAt(rr.logger, LogWarn, "resource receiver: re-REQ: %v", err)
 			}
 			timer.Reset(lossRecoveryInterval)
 
@@ -366,7 +366,7 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 				// lossy link, not worth logging or resetting timers for.
 				continue
 			default:
-				rr.logger.Printf("resource receiver: place part: %v", err)
+				logAt(rr.logger, LogInfo, "resource receiver: place part: %v", err)
 				continue
 			}
 			// A real part landed — push the loss-recovery timer out.
@@ -382,13 +382,13 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 			// fully drained — NOT after every part (see pendingTarget).
 			if rr.windowComplete() && rr.receivedCount < len(rr.parts) {
 				if err := rr.requestNextWindow(); err != nil {
-					rr.logger.Printf("resource receiver: window REQ: %v", err)
+					logAt(rr.logger, LogWarn, "resource receiver: window REQ: %v", err)
 				}
 			}
 
 		case hmu := <-rr.hmuCh:
 			if err := rr.applyHmu(hmu); err != nil {
-				rr.logger.Printf("resource receiver: apply HMU: %v", err)
+				logAt(rr.logger, LogInfo, "resource receiver: apply HMU: %v", err)
 				if errors.Is(err, ErrResourceEmptyHmu) {
 					// Terminal per upstream ≥1.3.9 (SPEC §10.7): an empty
 					// hashmap continuation means the sender can never
@@ -397,7 +397,7 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 					// transfer timeout.
 					rr.state.Store(int32(ResourceStateFailed))
 					if cancelErr := rr.transport.broadcastResourceCancel(rr.link, rr.resourceHash, false); cancelErr != nil {
-						rr.logger.Printf("resource receiver: RCL on empty HMU: %v", cancelErr)
+						logAt(rr.logger, LogWarn, "resource receiver: RCL on empty HMU: %v", cancelErr)
 					}
 					return err
 				}
@@ -406,7 +406,7 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 			// HMU extended our hashmap; immediately request the new
 			// range.
 			if err := rr.requestNextWindow(); err != nil {
-				rr.logger.Printf("resource receiver: post-HMU REQ: %v", err)
+				logAt(rr.logger, LogWarn, "resource receiver: post-HMU REQ: %v", err)
 			}
 		}
 	}
@@ -419,18 +419,18 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 		// Politely tell the sender we can't reassemble so they don't
 		// keep retransmitting on watchdog.
 		if cancelErr := rr.transport.broadcastResourceCancel(rr.link, rr.resourceHash, false); cancelErr != nil {
-			rr.logger.Printf("resource receiver: RCL on assemble error: %v", cancelErr)
+			logAt(rr.logger, LogWarn, "resource receiver: RCL on assemble error: %v", cancelErr)
 		}
 		return err
 	}
 	rr.state.Store(int32(ResourceStateComplete))
-	rr.logger.Printf("resource receiver: complete link=%x resource=%s body=%d bytes",
+	logAt(rr.logger, LogInfo, "resource receiver: complete link=%x resource=%s body=%d bytes",
 		rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), len(body))
 
 	// Emit PRF before invoking the application callback so the sender
 	// gets fast confirmation even if OnAssembled is slow.
 	if err := rr.broadcastProof(); err != nil {
-		rr.logger.Printf("resource receiver: PRF emit: %v", err)
+		logAt(rr.logger, LogWarn, "resource receiver: PRF emit: %v", err)
 		// Continue to deliver the body anyway — failing PRF emit
 		// just means the sender will eventually time out, but we
 		// already have the body.

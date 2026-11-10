@@ -335,7 +335,7 @@ func (t *Transport) RequestPathAfter(targetDestHash []byte, minInterval time.Dur
 	if err != nil {
 		return err
 	}
-	t.logger.Printf("path? request for %s", key[:8])
+	logAt(t.logger, LogDebug, "path? request for %s", key[:8])
 	return t.Broadcast(pkt)
 }
 
@@ -407,7 +407,7 @@ func (t *Transport) Restore(k *KnownIdentity) {
 	if len(k.NameHash) == NameHashLen {
 		idHash := sha256.Sum256(k.PublicKey)
 		if !bytesEqual(DestinationHash(k.NameHash, idHash[:IdentityHashLen]), k.DestHash) {
-			t.logger.Printf("announce cache: refusing entry %x — dest_hash does not derive from its public key",
+			logAt(t.logger, LogWarn, "announce cache: refusing entry %x — dest_hash does not derive from its public key",
 				k.DestHash[:4])
 			return
 		}
@@ -470,7 +470,7 @@ func (t *Transport) Broadcast(p *Packet) error {
 	var firstErr error
 	for _, i := range ifaces {
 		if err := i.Send(wire); err != nil {
-			t.logger.Printf("send failed: %v", err)
+			logAt(t.logger, LogWarn, "send failed: %v", err)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -487,7 +487,7 @@ func (t *Transport) Run(ctx context.Context) {
 	t.mu.RUnlock()
 
 	if len(ifaces) == 0 {
-		t.logger.Printf("transport.Run: no interfaces — nothing to dispatch")
+		logAt(t.logger, LogError, "transport.Run: no interfaces — nothing to dispatch")
 		<-ctx.Done()
 		return
 	}
@@ -538,7 +538,7 @@ func (t *Transport) Run(ctx context.Context) {
 func (t *Transport) dispatch(raw []byte) {
 	p, err := ParsePacket(raw)
 	if err != nil {
-		t.rlog.Limited("packet-parse", "parse packet: %v", err)
+		t.rlog.Limited(LogInfo, "packet-parse", "parse packet: %v", err)
 		return
 	}
 	switch p.PacketType {
@@ -653,19 +653,19 @@ func (t *Transport) handlePacketProof(p *Packet) {
 		sig = p.Data
 	case ProofBodyExplicitLen:
 		if !bytesEqual(p.Data[:sha256.Size], w.fullHash) {
-			t.rlog.Limited("proof-mismatch", "packet proof for %x: explicit hash mismatch", p.DestHash[:4])
+			t.rlog.Limited(LogInfo, "proof-mismatch", "packet proof for %x: explicit hash mismatch", p.DestHash[:4])
 			return
 		}
 		sig = p.Data[sha256.Size:]
 	default:
-		t.rlog.Limited("proof-badlen", "packet proof for %x: bad body length %d", p.DestHash[:4], len(p.Data))
+		t.rlog.Limited(LogInfo, "proof-badlen", "packet proof for %x: bad body length %d", p.DestHash[:4], len(p.Data))
 		return
 	}
 	if !Validate(w.edPub, w.fullHash, sig) {
 		// Log-and-ignore rather than failing the waiter: an invalid
 		// proof from a third party must not mask a valid one the real
 		// recipient may still send.
-		t.rlog.Limited("proof-badsig", "packet proof for %x: invalid signature", p.DestHash[:4])
+		t.rlog.Limited(LogInfo, "proof-badsig", "packet proof for %x: invalid signature", p.DestHash[:4])
 		return
 	}
 	select {
@@ -677,11 +677,11 @@ func (t *Transport) handlePacketProof(p *Packet) {
 func (t *Transport) handleAnnounce(p *Packet) {
 	a, err := ParseAnnounce(p)
 	if err != nil {
-		t.rlog.Limited("announce-parse", "announce parse: %v", err)
+		t.rlog.Limited(LogInfo, "announce-parse", "announce parse: %v", err)
 		return
 	}
 	if err := a.Verify(); err != nil {
-		t.rlog.Limited("announce-verify", "announce verify: %v", err)
+		t.rlog.Limited(LogInfo, "announce-verify", "announce verify: %v", err)
 		return
 	}
 
@@ -704,7 +704,7 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	// hijack the destination.
 	if prev != nil && len(prev.PublicKey) > 0 && !bytesEqual(prev.PublicKey, a.PublicKey) {
 		t.mu.Unlock()
-		t.logger.Printf("announce REJECTED: dest=%x already bound to a different public key (first-announcer-wins, SPEC §4.5)", a.DestHash[:4])
+		logAt(t.logger, LogWarn, "announce REJECTED: dest=%x already bound to a different public key (first-announcer-wins, SPEC §4.5)", a.DestHash[:4])
 		return
 	}
 	// Snapshot prior-state fields BEFORE we update prev so the post-unlock
@@ -803,10 +803,10 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	switch {
 	case wasNewIdentity:
 		displayName := LXMFDisplayNameFromAnnounce(a)
-		t.logger.Printf("announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
+		logAt(t.logger, LogInfo, "announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
 	case now.Sub(prevLastSeen) >= AnnounceLogReturnThreshold:
 		displayName := LXMFDisplayNameFromAnnounce(a)
-		t.logger.Printf("announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
+		logAt(t.logger, LogInfo, "announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
 	}
 	for _, h := range handlers {
 		if h.AspectMatch(a.NameHash) {
@@ -830,9 +830,9 @@ func (t *Transport) handleData(p *Packet) {
 	// destination didn't supply an identity (e.g. some unit-test setups).
 	if dest.Identity != nil && p.Context == ContextNone && p.DestinationType == DestinationSingle {
 		if proof, err := ProveOpportunistic(dest.Identity, p); err != nil {
-			t.logger.Printf("prove: %v", err)
+			logAt(t.logger, LogError, "prove: %v", err)
 		} else if err := t.Broadcast(proof); err != nil {
-			t.logger.Printf("proof broadcast: %v", err)
+			logAt(t.logger, LogWarn, "proof broadcast: %v", err)
 		}
 	}
 
@@ -851,13 +851,13 @@ func (t *Transport) handleLinkRequest(p *Packet) {
 		return // LINKREQUEST not for us
 	}
 	if dest.Identity == nil {
-		t.rlog.Limited("linkreq-noidentity", "LINKREQUEST for local %x but no identity registered (cannot sign LRPROOF)", p.DestHash[:4])
+		t.rlog.Limited(LogWarn, "linkreq-noidentity", "LINKREQUEST for local %x but no identity registered (cannot sign LRPROOF)", p.DestHash[:4])
 		return
 	}
 
 	link, lrProof, err := t.linkManager.AcceptIncomingLinkRequest(p, dest.Identity, nil /* signalling */)
 	if err != nil {
-		t.logger.Printf("AcceptIncomingLinkRequest: %v", err)
+		logAt(t.logger, LogInfo, "AcceptIncomingLinkRequest: %v", err)
 		return
 	}
 	// Wire the local destination's OnLinkPlaintext callback if it has one.
@@ -865,7 +865,7 @@ func (t *Transport) handleLinkRequest(p *Packet) {
 	link.OnInboundData = dest.OnLinkPlaintext
 	link.mu.Unlock()
 
-	t.logger.Printf("link established (responder): id=%x peer LRREQ from %x", link.ID[:4], p.DestHash[:4])
+	logAt(t.logger, LogInfo, "link established (responder): id=%x peer LRREQ from %x", link.ID[:4], p.DestHash[:4])
 	t.broadcastWithRetransmits(lrProof, "LRPROOF")
 }
 
@@ -961,15 +961,15 @@ func (t *Transport) handlePathRequest(p *Packet) {
 		return
 	}
 	if local.BuildAnnounce == nil {
-		t.logger.Printf("path? for %x but no BuildAnnounce on local destination — cannot respond", target[:4])
+		logAt(t.logger, LogWarn, "path? for %x but no BuildAnnounce on local destination — cannot respond", target[:4])
 		return
 	}
 	pkt, err := local.BuildAnnounce(ContextPathResponse)
 	if err != nil {
-		t.logger.Printf("build path-response announce: %v", err)
+		logAt(t.logger, LogError, "build path-response announce: %v", err)
 		return
 	}
-	t.logger.Printf("path? answered for %x (tag %x)", target[:4], tag[:4])
+	logAt(t.logger, LogDebug, "path? answered for %x (tag %x)", target[:4], tag[:4])
 	t.broadcastWithRetransmits(pkt, "path-response announce")
 }
 
@@ -980,7 +980,7 @@ func (t *Transport) handlePathRequest(p *Packet) {
 func (t *Transport) handleLRProof(p *Packet) {
 	parsed, err := ParseLRProof(p)
 	if err != nil {
-		t.rlog.Limited("lrproof-parse", "LRPROOF parse: %v", err)
+		t.rlog.Limited(LogInfo, "lrproof-parse", "LRPROOF parse: %v", err)
 		return
 	}
 	// We don't know the responder dest_hash from the LRPROOF outer header
@@ -988,26 +988,26 @@ func (t *Transport) handleLRProof(p *Packet) {
 	// pending link to find which peer this proof is for.
 	link := t.linkManager.Get(parsed.LinkID)
 	if link == nil {
-		t.rlog.Limited("lrproof-unknown", "LRPROOF for unknown link_id %x", parsed.LinkID[:4])
+		t.rlog.Limited(LogInfo, "lrproof-unknown", "LRPROOF for unknown link_id %x", parsed.LinkID[:4])
 		return
 	}
 	link.mu.Lock()
 	peerDest := append([]byte(nil), link.peerDestHash...)
 	link.mu.Unlock()
 	if peerDest == nil {
-		t.logger.Printf("LRPROOF for link without peerDestHash (we were the responder?)")
+		logAt(t.logger, LogInfo, "LRPROOF for link without peerDestHash (we were the responder?)")
 		return
 	}
 	known := t.Recall(peerDest)
 	if known == nil {
-		t.logger.Printf("LRPROOF received but responder %x not in known table — must have announced first", peerDest[:4])
+		logAt(t.logger, LogInfo, "LRPROOF received but responder %x not in known table — must have announced first", peerDest[:4])
 		return
 	}
 	if _, err := t.linkManager.HandleLRProof(p, known.Ed25519Public()); err != nil {
-		t.logger.Printf("HandleLRProof: %v", err)
+		logAt(t.logger, LogInfo, "HandleLRProof: %v", err)
 		return
 	}
-	t.logger.Printf("link active (initiator): id=%x", parsed.LinkID[:4])
+	logAt(t.logger, LogInfo, "link active (initiator): id=%x", parsed.LinkID[:4])
 
 	// Upstream RNS: after the initiator validates the LRPROOF, it sends
 	// an LRRTT packet to the responder carrying the measured RTT (a
@@ -1025,7 +1025,7 @@ func (t *Transport) handleLRProof(p *Packet) {
 	// localhost rnsd hops. The exact value is non-load-bearing — only
 	// the act of sending the packet matters.
 	if err := t.sendLRRTT(parsed.LinkID, link, 0.05); err != nil {
-		t.logger.Printf("send LRRTT: %v", err)
+		logAt(t.logger, LogWarn, "send LRRTT: %v", err)
 	}
 
 	// SPEC §6.6 LINKIDENTIFY: prove which identity is driving this link,
@@ -1039,7 +1039,7 @@ func (t *Transport) handleLRProof(p *Packet) {
 	t.mu.RUnlock()
 	if initID != nil {
 		if err := t.sendLinkIdentify(parsed.LinkID, link, initID); err != nil {
-			t.logger.Printf("send LINKIDENTIFY: %v", err)
+			logAt(t.logger, LogWarn, "send LINKIDENTIFY: %v", err)
 		}
 	}
 }
@@ -1160,11 +1160,11 @@ func (t *Transport) sendLRRTT(linkID []byte, link *Link, rttSec float64) error {
 func (t *Transport) handleLinkIdentify(p *Packet) {
 	link, pubKey, err := t.linkManager.HandleLinkIdentify(p)
 	if err != nil {
-		t.logger.Printf("link identify: %v", err)
+		logAt(t.logger, LogInfo, "link identify: %v", err)
 		return
 	}
 	idHash := IdentityHashFromPublicKey(pubKey)
-	t.logger.Printf("link %x identified as %x (SPEC §6.7.6, verified)", link.ID[:4], idHash)
+	logAt(t.logger, LogInfo, "link %x identified as %x (SPEC §6.7.6, verified)", link.ID[:4], idHash)
 	if h := t.linkManager.remoteIdentifiedHandler(); h != nil {
 		h(append([]byte(nil), link.ID...), append([]byte(nil), pubKey...))
 	}
@@ -1207,9 +1207,9 @@ func (t *Transport) teardownLink(linkID []byte, reason byte) {
 	// this packet is encrypted under.
 	if active {
 		if pkt, err := BuildLinkClose(linkID, signing, encryption); err != nil {
-			t.logger.Printf("build linkclose for %x: %v", linkID[:4], err)
+			logAt(t.logger, LogError, "build linkclose for %x: %v", linkID[:4], err)
 		} else if err := t.Broadcast(pkt); err != nil {
-			t.logger.Printf("send linkclose for %x: %v", linkID[:4], err)
+			logAt(t.logger, LogWarn, "send linkclose for %x: %v", linkID[:4], err)
 		}
 	}
 	t.linkManager.closeLink(linkID, reason)
@@ -1223,10 +1223,10 @@ func (t *Transport) handleLinkClose(p *Packet) {
 		// arrives after the link is already gone. Logged rather than
 		// ignored because an authentication failure looks the same
 		// from here and is worth seeing.
-		t.logger.Printf("link close: %v", err)
+		logAt(t.logger, LogInfo, "link close: %v", err)
 		return
 	}
-	t.logger.Printf("link %x closed by peer (SPEC §6.7.3, reason 0x%02x)", link.ID[:4], reason)
+	logAt(t.logger, LogInfo, "link %x closed by peer (SPEC §6.7.3, reason 0x%02x)", link.ID[:4], reason)
 }
 
 // handleLinkData processes inbound DATA packets addressed to a link_id.
@@ -1261,11 +1261,11 @@ func (t *Transport) handleLinkData(p *Packet) {
 		if isResponder && len(p.Data) == 1 && p.Data[0] == keepalivePing {
 			pong, err := BuildLinkKeepalivePong(l.ID)
 			if err != nil {
-				t.logger.Printf("build keepalive pong: %v", err)
+				logAt(t.logger, LogError, "build keepalive pong: %v", err)
 				return
 			}
 			if err := t.Broadcast(pong); err != nil {
-				t.logger.Printf("keepalive pong broadcast: %v", err)
+				logAt(t.logger, LogWarn, "keepalive pong broadcast: %v", err)
 			}
 		}
 		return
@@ -1332,7 +1332,7 @@ func (t *Transport) handleLinkData(p *Packet) {
 
 	_, link, err := t.linkManager.HandleLinkData(p)
 	if err != nil {
-		t.logger.Printf("link data: %v", err)
+		logAt(t.logger, LogInfo, "link data: %v", err)
 		return
 	}
 
@@ -1368,12 +1368,12 @@ func (t *Transport) handleLinkData(p *Packet) {
 	case initPriv != nil:
 		sign = func(msg []byte) []byte { return ed25519.Sign(initPriv, msg) }
 	default:
-		t.logger.Printf("link PROOF skipped: no signing key for link=%x", linkID[:4])
+		logAt(t.logger, LogWarn, "link PROOF skipped: no signing key for link=%x", linkID[:4])
 		return
 	}
 	proof, err := BuildLinkProof(linkID, sign, p)
 	if err != nil {
-		t.logger.Printf("build link proof: %v", err)
+		logAt(t.logger, LogError, "build link proof: %v", err)
 		return
 	}
 	t.broadcastWithRetransmits(proof, "link DATA PROOF")
@@ -1395,7 +1395,7 @@ func (t *Transport) handleLinkData(p *Packet) {
 // `label` is just for the diagnostic log line on broadcast failure.
 func (t *Transport) broadcastWithRetransmits(pkt *Packet, label string) {
 	if err := t.Broadcast(pkt); err != nil {
-		t.logger.Printf("broadcast %s: %v", label, err)
+		logAt(t.logger, LogWarn, "broadcast %s: %v", label, err)
 		return
 	}
 	// Bound the retransmit fleet. This fires once per inbound
@@ -1418,11 +1418,11 @@ func (t *Transport) broadcastWithRetransmits(pkt *Packet, label string) {
 		defer t.retransmitSlots.release()
 		time.Sleep(250 * time.Millisecond)
 		if err := t.Broadcast(pkt); err != nil {
-			t.logger.Printf("retransmit %s (1/2): %v", label, err)
+			logAt(t.logger, LogWarn, "retransmit %s (1/2): %v", label, err)
 		}
 		time.Sleep(750 * time.Millisecond)
 		if err := t.Broadcast(pkt); err != nil {
-			t.logger.Printf("retransmit %s (2/2): %v", label, err)
+			logAt(t.logger, LogWarn, "retransmit %s (2/2): %v", label, err)
 		}
 	}()
 }
@@ -1550,7 +1550,7 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 		// forces acquireLinkTo to handshake fresh on the next attempt.
 		if err != nil && (errors.Is(err, ErrResourceTimeout) || errors.Is(err, context.DeadlineExceeded)) {
 			t.linkManager.CloseLink(link.ID)
-			t.logger.Printf("torn down stale outbound link %x after Resource timeout", link.ID[:4])
+			logAt(t.logger, LogInfo, "torn down stale outbound link %x after Resource timeout", link.ID[:4])
 		}
 		return err
 	}
@@ -1606,7 +1606,7 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 		// the cached link so the next retry handshakes fresh instead of
 		// burning more attempts on a link the peer no longer knows.
 		t.linkManager.CloseLink(link.ID)
-		t.logger.Printf("torn down stale outbound link %x after DATA proof timeout", link.ID[:4])
+		logAt(t.logger, LogInfo, "torn down stale outbound link %x after DATA proof timeout", link.ID[:4])
 		return ErrLinkProofTimeout
 	}
 }
@@ -1671,7 +1671,7 @@ func (t *Transport) acquireLinkTo(responderDestHash []byte, deadline time.Time) 
 func (t *Transport) handleLinkProof(p *Packet) {
 	link := t.linkManager.Get(p.DestHash)
 	if link == nil {
-		t.rlog.Limited("linkproof-unknown", "link DATA proof for unknown link_id %x", p.DestHash[:4])
+		t.rlog.Limited(LogInfo, "linkproof-unknown", "link DATA proof for unknown link_id %x", p.DestHash[:4])
 		return
 	}
 	link.mu.Lock()
@@ -1686,7 +1686,7 @@ func (t *Transport) handleLinkProof(p *Packet) {
 
 	packetHash, err := ValidateLinkProof(p, peerPub)
 	if err != nil {
-		t.rlog.Limited("linkproof-reject", "link DATA proof reject: %v", err)
+		t.rlog.Limited(LogInfo, "linkproof-reject", "link DATA proof reject: %v", err)
 		return
 	}
 	link.mu.Lock()
@@ -1697,7 +1697,7 @@ func (t *Transport) handleLinkProof(p *Packet) {
 		// duplicate ack, or an ack that arrived after our wait timed
 		// out). Logged at debug-equivalent so an operator chasing
 		// retransmits can see them.
-		t.logger.Printf("link DATA proof: no waiter for packet_hash %x (link=%x)", packetHash[:4], link.ID[:4])
+		logAt(t.logger, LogDebug, "link DATA proof: no waiter for packet_hash %x (link=%x)", packetHash[:4], link.ID[:4])
 	}
 }
 
@@ -1847,7 +1847,7 @@ func (t *Transport) sweepLinks() {
 
 	for _, a := range actions {
 		if a.close {
-			t.logger.Printf("link sweep: closing idle link %x", a.linkID[:4])
+			logAt(t.logger, LogInfo, "link sweep: closing idle link %x", a.linkID[:4])
 			// SPEC §6.7.2: the watchdog emits a teardown packet AND
 			// sets teardown_reason = TIMEOUT, so the peer does not sit
 			// through its own timeout to reach the conclusion we just
@@ -1859,7 +1859,7 @@ func (t *Transport) sweepLinks() {
 		if a.keepalive {
 			pkt, err := BuildLinkKeepalive(a.linkID)
 			if err != nil {
-				t.logger.Printf("link sweep: build keepalive: %v", err)
+				logAt(t.logger, LogError, "link sweep: build keepalive: %v", err)
 				continue
 			}
 			// KEEPALIVE stays HEADER_1 even for a multi-hop peer: link
@@ -1869,7 +1869,7 @@ func (t *Transport) sweepLinks() {
 			// another transport instance" (SPEC §6.4.3) — so the link
 			// would silently go stale on any multi-hop path.
 			if err := t.Broadcast(pkt); err != nil {
-				t.logger.Printf("link sweep: broadcast keepalive: %v", err)
+				logAt(t.logger, LogWarn, "link sweep: broadcast keepalive: %v", err)
 				continue
 			}
 			// Bump LastActivity so we don't immediately re-emit on the
@@ -1899,11 +1899,11 @@ func (t *Transport) AnnouncePeriodically(ctx context.Context, interval time.Dura
 	emit := func() {
 		p, err := build()
 		if err != nil {
-			t.logger.Printf("announce build: %v", err)
+			logAt(t.logger, LogError, "announce build: %v", err)
 			return
 		}
 		if err := t.Broadcast(p); err != nil {
-			t.logger.Printf("announce broadcast: %v", err)
+			logAt(t.logger, LogWarn, "announce broadcast: %v", err)
 		}
 	}
 	// Startup burst: 0s, 5s, 30s. Keeps fresh-connect peers from

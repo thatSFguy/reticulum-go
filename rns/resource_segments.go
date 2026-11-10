@@ -376,7 +376,7 @@ func (t *Transport) SendSegmentedResourceOverLink(ctx context.Context, link *Lin
 		if err := rs.Run(ctx); err != nil {
 			return fmt.Errorf("segment %d/%d: %w", i+1, total, err)
 		}
-		t.logger.Printf("resource segment %d/%d delivered on link %x", i+1, total, link.ID[:4])
+		logAt(t.logger, LogDebug, "resource segment %d/%d delivered on link %x", i+1, total, link.ID[:4])
 	}
 	return nil
 }

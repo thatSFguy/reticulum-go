@@ -83,7 +83,7 @@ func (r *RNodeInterface) readLoop() {
 		cmd, payload, err := dec.NextFrame()
 		if err != nil {
 			if !r.closed.Load() {
-				r.logger.Printf("rnode read: %v", err)
+				logAt(r.logger, LogError, "rnode read: %v", err)
 			}
 			return
 		}
