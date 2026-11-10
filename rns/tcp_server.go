@@ -106,7 +106,7 @@ func (s *TCPServer) acceptLoop() {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			s.logger.Printf("tcp server accept: %v", err)
+			logAt(s.logger, LogError, "tcp server accept: %v", err)
 			return
 		}
 
@@ -117,7 +117,7 @@ func (s *TCPServer) acceptLoop() {
 			// Refusing beats accepting-then-dropping: the peer sees the
 			// close immediately and can try elsewhere, and we do not
 			// spend a goroutine on a connection we will not serve.
-			s.logger.Printf("tcp server: refusing %s, at the %d-peer cap", conn.RemoteAddr(), s.maxPeers)
+			logAt(s.logger, LogWarn, "tcp server: refusing %s, at the %d-peer cap", conn.RemoteAddr(), s.maxPeers)
 			_ = conn.Close()
 			continue
 		}
@@ -128,7 +128,7 @@ func (s *TCPServer) acceptLoop() {
 		n := len(s.peers)
 		s.mu.Unlock()
 		s.accepted.Add(1)
-		s.logger.Printf("tcp server: accepted %s (%d peers)", conn.RemoteAddr(), n)
+		logAt(s.logger, LogInfo, "tcp server: accepted %s (%d peers)", conn.RemoteAddr(), n)
 		go s.pump(client, conn.RemoteAddr())
 	}
 }
@@ -147,7 +147,7 @@ func (s *TCPServer) pump(client *TCPClient, addr net.Addr) {
 		n := len(s.peers)
 		s.mu.Unlock()
 		_ = client.Close()
-		s.logger.Printf("tcp server: %s disconnected (%d peers): %v", addr, n, client.Err())
+		logAt(s.logger, LogInfo, "tcp server: %s disconnected (%d peers): %v", addr, n, client.Err())
 	}()
 
 	for {

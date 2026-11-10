@@ -289,7 +289,7 @@ func (c *Channel) dispatch(m ChannelMessage) {
 func (t *Transport) handleChannel(p *Packet) {
 	l := t.linkManager.Get(p.DestHash)
 	if l == nil {
-		t.logger.Printf("channel: unknown link_id %x", p.DestHash)
+		logAt(t.logger, LogInfo, "channel: unknown link_id %x", p.DestHash)
 		return
 	}
 	l.mu.Lock()
@@ -298,13 +298,13 @@ func (t *Transport) handleChannel(p *Packet) {
 
 	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
 	if err != nil {
-		t.logger.Printf("channel decrypt: %v", err)
+		logAt(t.logger, LogInfo, "channel decrypt: %v", err)
 		return
 	}
 	l.NoteInboundTraffic()
 	m, err := ParseChannelMessage(plaintext)
 	if err != nil {
-		t.logger.Printf("channel parse: %v", err)
+		logAt(t.logger, LogInfo, "channel parse: %v", err)
 		return
 	}
 	c := t.channelFor(p.DestHash)
@@ -312,7 +312,7 @@ func (t *Transport) handleChannel(p *Packet) {
 		// No channel opened on this link, so nothing is listening.
 		// Upstream behaves the same way: a Channel exists only once the
 		// application asks for one.
-		t.logger.Printf("channel message type 0x%04x on link %x with no channel open", m.Type, p.DestHash[:4])
+		logAt(t.logger, LogInfo, "channel message type 0x%04x on link %x with no channel open", m.Type, p.DestHash[:4])
 		return
 	}
 	c.dispatch(m)

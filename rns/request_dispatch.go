@@ -88,12 +88,12 @@ func (t *Transport) SendRequest(linkID []byte, path string, data any) (*RequestR
 			ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(len(packed)))
 			defer cancel()
 			if err := t.sendRPCResourceOverLink(ctx, l, packed, nil, requestID, ResourceFlagIsRequest); err != nil {
-				t.logger.Printf("resource request %x on link %x: %v", requestID[:4], linkID[:4], err)
+				logAt(t.logger, LogWarn, "resource request %x on link %x: %v", requestID[:4], linkID[:4], err)
 				t.cancelPendingRequest(requestID)
 				receipt.deliver(requestResult{err: fmt.Errorf("resource request: %w", err)})
 			}
 		}()
-		t.logger.Printf("request %x sent on link %x path %q by Resource (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
+		logAt(t.logger, LogDebug, "request %x sent on link %x path %q by Resource (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
 		return receipt, nil
 	}
 
@@ -101,7 +101,7 @@ func (t *Transport) SendRequest(linkID []byte, path string, data any) (*RequestR
 		t.cancelPendingRequest(requestID)
 		return nil, err
 	}
-	t.logger.Printf("request %x sent on link %x path %q (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
+	logAt(t.logger, LogDebug, "request %x sent on link %x path %q (%d bytes)", requestID[:4], linkID[:4], path, len(packed))
 	return receipt, nil
 }
 
@@ -133,7 +133,7 @@ func (t *Transport) takePendingRequest(requestID []byte) *RequestReceipt {
 func (t *Transport) handleRequest(p *Packet) {
 	l := t.linkManager.Get(p.DestHash)
 	if l == nil {
-		t.logger.Printf("request: unknown link_id %x", p.DestHash)
+		logAt(t.logger, LogInfo, "request: unknown link_id %x", p.DestHash)
 		return
 	}
 	l.mu.Lock()
@@ -141,13 +141,13 @@ func (t *Transport) handleRequest(p *Packet) {
 	signing, encryption := l.Signing, l.Encryption
 	l.mu.Unlock()
 	if state != LinkActive {
-		t.logger.Printf("request on link %x in state %s", p.DestHash[:4], state)
+		logAt(t.logger, LogInfo, "request on link %x in state %s", p.DestHash[:4], state)
 		return
 	}
 
 	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
 	if err != nil {
-		t.logger.Printf("request decrypt: %v", err)
+		logAt(t.logger, LogInfo, "request decrypt: %v", err)
 		return
 	}
 	// The peer just proved it holds the session keys, so this counts as
@@ -156,7 +156,7 @@ func (t *Transport) handleRequest(p *Packet) {
 	l.NoteInboundTraffic()
 	requestID, err := RequestIDFromPacket(p)
 	if err != nil {
-		t.logger.Printf("request id: %v", err)
+		logAt(t.logger, LogInfo, "request id: %v", err)
 		return
 	}
 	t.serveRequest(l, plaintext, requestID)
@@ -177,7 +177,7 @@ func (t *Transport) serveRequest(l *Link, plaintext, requestID []byte) {
 
 	ts, pathHash, data, err := ParseRequest(plaintext)
 	if err != nil {
-		t.logger.Printf("request parse: %v", err)
+		logAt(t.logger, LogInfo, "request parse: %v", err)
 		return
 	}
 
@@ -185,13 +185,13 @@ func (t *Transport) serveRequest(l *Link, plaintext, requestID []byte) {
 	if entry == nil {
 		// Upstream drops silently; log so an operator can see a client
 		// asking for a path this node does not serve.
-		t.logger.Printf("request: %v (path_hash %x on link %x)", ErrRequestNoHandler, pathHash[:4], linkID[:4])
+		logAt(t.logger, LogInfo, "request: %v (path_hash %x on link %x)", ErrRequestNoHandler, pathHash[:4], linkID[:4])
 		return
 	}
 
 	remote := l.RemoteIdentity()
 	if !entry.permits(remote) {
-		t.logger.Printf("request %q refused on link %x: %v (allow=%d, identified=%t)",
+		logAt(t.logger, LogInfo, "request %q refused on link %x: %v (allow=%d, identified=%t)",
 			entry.path, linkID[:4], ErrRequestNotAllowed, entry.allow, remote != nil)
 		return
 	}
@@ -207,13 +207,13 @@ func (t *Transport) serveRequest(l *Link, plaintext, requestID []byte) {
 	if err != nil {
 		// A generator that errors sends nothing, matching upstream's
 		// None return. The initiator's own timeout covers it.
-		t.logger.Printf("request handler %q: %v", entry.path, err)
+		logAt(t.logger, LogWarn, "request handler %q: %v", entry.path, err)
 		return
 	}
 
 	packed, err := PackResponse(requestID, response)
 	if err != nil {
-		t.logger.Printf("pack response for %q: %v", entry.path, err)
+		logAt(t.logger, LogError, "pack response for %q: %v", entry.path, err)
 		return
 	}
 	if len(packed) > LinkMDU {
@@ -225,24 +225,24 @@ func (t *Transport) serveRequest(l *Link, plaintext, requestID []byte) {
 			ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(len(packed)))
 			defer cancel()
 			if err := t.sendRPCResourceOverLink(ctx, l, packed, nil, requestID, ResourceFlagIsResponse); err != nil {
-				t.logger.Printf("resource response for %q: %v", entry.path, err)
+				logAt(t.logger, LogWarn, "resource response for %q: %v", entry.path, err)
 			}
 		}()
-		t.logger.Printf("request %q answered on link %x by Resource (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
+		logAt(t.logger, LogDebug, "request %q answered on link %x by Resource (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
 		return
 	}
 
 	respPkt, err := BuildLinkDataPacket(linkID, signing, encryption, packed)
 	if err != nil {
-		t.logger.Printf("build response packet: %v", err)
+		logAt(t.logger, LogError, "build response packet: %v", err)
 		return
 	}
 	respPkt.Context = ContextResponse
 	if err := t.Broadcast(respPkt); err != nil {
-		t.logger.Printf("response broadcast: %v", err)
+		logAt(t.logger, LogWarn, "response broadcast: %v", err)
 		return
 	}
-	t.logger.Printf("request %q answered on link %x (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
+	logAt(t.logger, LogDebug, "request %q answered on link %x (id %x, %d bytes)", entry.path, linkID[:4], requestID[:4], len(packed))
 }
 
 // serveResourceRequest handles a §11.1 REQUEST that arrived as a
@@ -257,7 +257,7 @@ func (t *Transport) serveResourceRequest(l *Link, requestID, body []byte) {
 func (t *Transport) handleResponse(p *Packet) {
 	l := t.linkManager.Get(p.DestHash)
 	if l == nil {
-		t.logger.Printf("response: unknown link_id %x", p.DestHash)
+		logAt(t.logger, LogInfo, "response: unknown link_id %x", p.DestHash)
 		return
 	}
 	l.mu.Lock()
@@ -266,13 +266,13 @@ func (t *Transport) handleResponse(p *Packet) {
 
 	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
 	if err != nil {
-		t.logger.Printf("response decrypt: %v", err)
+		logAt(t.logger, LogInfo, "response decrypt: %v", err)
 		return
 	}
 	l.NoteInboundTraffic()
 	requestID, response, err := ParseResponse(plaintext)
 	if err != nil {
-		t.logger.Printf("response parse: %v", err)
+		logAt(t.logger, LogInfo, "response parse: %v", err)
 		return
 	}
 	t.deliverResponse(requestID, response)
@@ -289,11 +289,11 @@ func (t *Transport) handleResponse(p *Packet) {
 func (t *Transport) deliverResponse(requestID []byte, response any) {
 	receipt := t.takePendingRequest(requestID)
 	if receipt == nil {
-		t.logger.Printf("response: %v (id %x)", ErrResponseUnsolicited, requestID[:4])
+		logAt(t.logger, LogInfo, "response: %v (id %x)", ErrResponseUnsolicited, requestID[:4])
 		return
 	}
 	receipt.deliver(requestResult{response: response})
-	t.logger.Printf("request %x answered (path %q)", requestID[:4], receipt.Path)
+	logAt(t.logger, LogDebug, "request %x answered (path %q)", requestID[:4], receipt.Path)
 }
 
 // deliverResourceResponse handles a §11.2 RESPONSE that arrived as a
@@ -305,13 +305,13 @@ func (t *Transport) deliverResponse(requestID []byte, response any) {
 func (t *Transport) deliverResourceResponse(requestID, body []byte) {
 	innerID, response, err := ParseResponse(body)
 	if err != nil {
-		t.logger.Printf("resource response parse (id %x): %v", requestID[:4], err)
+		logAt(t.logger, LogInfo, "resource response parse (id %x): %v", requestID[:4], err)
 		return
 	}
 	if !bytesEqual(innerID, requestID) {
 		// The advertisement and the envelope disagree about which
 		// request this answers. Trust neither.
-		t.logger.Printf("resource response id mismatch: adv %x, envelope %x", requestID[:4], innerID[:4])
+		logAt(t.logger, LogInfo, "resource response id mismatch: adv %x, envelope %x", requestID[:4], innerID[:4])
 		return
 	}
 	t.deliverResponse(requestID, response)

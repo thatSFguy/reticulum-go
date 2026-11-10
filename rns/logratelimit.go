@@ -66,7 +66,11 @@ func (l *rateLimitedLogger) Printf(format string, args ...any) {
 // category, appending a suppression count when lines were dropped.
 // Categories MUST be compile-time constants — never attacker-controlled
 // text — so the counter map stays bounded.
-func (l *rateLimitedLogger) Limited(category, format string, args ...any) {
+//
+// The suppression summary is emitted at the same level as the lines it
+// stands in for, so a threshold that hides a category also hides its
+// "N further messages suppressed" line.
+func (l *rateLimitedLogger) Limited(level LogLevel, category, format string, args ...any) {
 	now := time.Now()
 
 	l.mu.Lock()
@@ -83,7 +87,7 @@ func (l *rateLimitedLogger) Limited(category, format string, args ...any) {
 		c.suppressed = 0
 		if dropped > 0 {
 			l.mu.Unlock()
-			l.inner.Printf("(%s: %d further messages suppressed in the last %s)",
+			logAt(l.inner, level, "(%s: %d further messages suppressed in the last %s)",
 				category, dropped, l.interval)
 			l.mu.Lock()
 		}
@@ -96,5 +100,5 @@ func (l *rateLimitedLogger) Limited(category, format string, args ...any) {
 	c.inWindow++
 	l.mu.Unlock()
 
-	l.inner.Printf(format, args...)
+	logAt(l.inner, level, format, args...)
 }

@@ -124,7 +124,7 @@ func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 		_ = inner.Close()
 
 		survived := time.Since(connectedAt)
-		r.logger.Printf("tcp interface %s disconnected after %v: %v — reconnecting",
+		logAt(r.logger, LogWarn, "tcp interface %s disconnected after %v: %v — reconnecting",
 			r.addr, survived.Round(time.Millisecond), inner.Err())
 
 		lifetime := &survived
@@ -135,7 +135,7 @@ func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 
 			plan := r.policy.decide(lifetime, readBackoff, connectBackoff)
 			if lifetime != nil && !plan.wasReadFailure {
-				r.logger.Printf("tcp interface %s accepted then closed us after %v — "+
+				logAt(r.logger, LogWarn, "tcp interface %s accepted then closed us after %v — "+
 					"treating as a refusal, not a dropped session",
 					r.addr, survived.Round(time.Millisecond))
 			}
@@ -150,7 +150,7 @@ func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 
 			next, err := r.dial()
 			if err != nil {
-				r.logger.Printf("tcp reconnect %s: %v — retrying in ~%v",
+				logAt(r.logger, LogWarn, "tcp reconnect %s: %v — retrying in ~%v",
 					r.addr, err, connectBackoff.Round(time.Second))
 				lifetime = nil
 				continue
@@ -159,7 +159,7 @@ func (r *ReconnectingTCPClient) supervise(initial *TCPClient) {
 			r.mu.Lock()
 			r.cur = next
 			r.mu.Unlock()
-			r.logger.Printf("tcp interface %s reconnected", r.addr)
+			logAt(r.logger, LogInfo, "tcp interface %s reconnected", r.addr)
 			inner = next
 			connectedAt = time.Now()
 			break

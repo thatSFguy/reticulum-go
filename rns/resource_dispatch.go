@@ -25,7 +25,7 @@ import (
 func (t *Transport) handleResourceControl(p *Packet) {
 	link := t.linkManager.Get(p.DestHash)
 	if link == nil {
-		t.logger.Printf("resource control 0x%02x for unknown link_id %x", p.Context, p.DestHash[:4])
+		logAt(t.logger, LogInfo, "resource control 0x%02x for unknown link_id %x", p.Context, p.DestHash[:4])
 		return
 	}
 	link.mu.Lock()
@@ -34,12 +34,12 @@ func (t *Transport) handleResourceControl(p *Packet) {
 	encryption := link.Encryption
 	link.mu.Unlock()
 	if state != LinkActive {
-		t.logger.Printf("resource control 0x%02x on link in state %s", p.Context, state)
+		logAt(t.logger, LogInfo, "resource control 0x%02x on link in state %s", p.Context, state)
 		return
 	}
 	plaintext, err := LinkTokenDecrypt(p.Data, signing, encryption)
 	if err != nil {
-		t.logger.Printf("resource control decrypt: %v", err)
+		logAt(t.logger, LogInfo, "resource control decrypt: %v", err)
 		return
 	}
 	// Successful link-layer decrypt proves the peer holds the session
@@ -63,7 +63,7 @@ func (t *Transport) handleResourceControl(p *Packet) {
 	case ContextResourceRCL:
 		t.handleResourceCancelInbound(link, plaintext, false /* receiver-side cancel → tells sender */)
 	default:
-		t.logger.Printf("resource control: unexpected context 0x%02x", p.Context)
+		logAt(t.logger, LogInfo, "resource control: unexpected context 0x%02x", p.Context)
 	}
 }
 
@@ -74,20 +74,20 @@ func (t *Transport) handleResourceControl(p *Packet) {
 func (t *Transport) handleResourceAdv(link *Link, plaintext []byte) {
 	adv, err := ParseResourceAdv(plaintext)
 	if err != nil {
-		t.logger.Printf("resource ADV parse: %v", err)
+		logAt(t.logger, LogInfo, "resource ADV parse: %v", err)
 		// If the ADV was structurally malformed we can't even RCL
 		// (no resource_hash to cite). The sender's watchdog will give
 		// up on its own.
 		return
 	}
-	t.logger.Printf("resource ADV inbound link=%x resource=%s parts=%d t=%d d=%d",
+	logAt(t.logger, LogDebug, "resource ADV inbound link=%x resource=%s parts=%d t=%d d=%d",
 		link.ID[:4], ResourceHashShortHex(adv.Hash), adv.NumParts, adv.TransferSize, adv.DataSize)
 
 	if err := t.openResourceReceiver(link, adv); err != nil {
-		t.logger.Printf("resource ADV open receiver: %v", err)
+		logAt(t.logger, LogInfo, "resource ADV open receiver: %v", err)
 		// Politely reject so the sender stops retransmitting.
 		if rcErr := t.broadcastResourceCancel(link, adv.Hash, false /* RCL */); rcErr != nil {
-			t.logger.Printf("resource RCL emit: %v", rcErr)
+			logAt(t.logger, LogWarn, "resource RCL emit: %v", rcErr)
 		}
 	}
 }
@@ -99,12 +99,12 @@ func (t *Transport) handleResourceAdv(link *Link, plaintext []byte) {
 func (t *Transport) handleResourceReq(link *Link, plaintext []byte) {
 	req, err := ParseResourceReq(plaintext)
 	if err != nil {
-		t.logger.Printf("resource REQ parse: %v", err)
+		logAt(t.logger, LogInfo, "resource REQ parse: %v", err)
 		return
 	}
 	rs := t.linkManager.lookupResourceSender(link.ID, req.ResourceHash)
 	if rs == nil {
-		t.logger.Printf("resource REQ for unknown sender link=%x resource=%s",
+		logAt(t.logger, LogInfo, "resource REQ for unknown sender link=%x resource=%s",
 			link.ID[:4], ResourceHashShortHex(req.ResourceHash))
 		return
 	}
@@ -117,12 +117,12 @@ func (t *Transport) handleResourceReq(link *Link, plaintext []byte) {
 func (t *Transport) handleResourceHmu(link *Link, plaintext []byte) {
 	h, err := ParseResourceHmu(plaintext)
 	if err != nil {
-		t.logger.Printf("resource HMU parse: %v", err)
+		logAt(t.logger, LogInfo, "resource HMU parse: %v", err)
 		return
 	}
 	rr := t.linkManager.lookupResourceReceiver(link.ID, h.ResourceHash)
 	if rr == nil {
-		t.logger.Printf("resource HMU for unknown receiver link=%x resource=%s",
+		logAt(t.logger, LogInfo, "resource HMU for unknown receiver link=%x resource=%s",
 			link.ID[:4], ResourceHashShortHex(h.ResourceHash))
 		return
 	}
@@ -135,7 +135,7 @@ func (t *Transport) handleResourceHmu(link *Link, plaintext []byte) {
 func (t *Transport) handleResourceCancelInbound(link *Link, plaintext []byte, isICL bool) {
 	resourceHash, err := ParseResourceCancel(plaintext)
 	if err != nil {
-		t.logger.Printf("resource cancel parse: %v", err)
+		logAt(t.logger, LogInfo, "resource cancel parse: %v", err)
 		return
 	}
 	if isICL {
@@ -151,7 +151,7 @@ func (t *Transport) handleResourceCancelInbound(link *Link, plaintext []byte, is
 			return
 		}
 	}
-	t.logger.Printf("resource cancel for unknown transfer link=%x resource=%s isICL=%v",
+	logAt(t.logger, LogInfo, "resource cancel for unknown transfer link=%x resource=%s isICL=%v",
 		link.ID[:4], ResourceHashShortHex(resourceHash), isICL)
 }
 
@@ -192,12 +192,12 @@ func (t *Transport) handleResourcePart(p *Packet) {
 func (t *Transport) handleResourceProof(p *Packet) {
 	link := t.linkManager.Get(p.DestHash)
 	if link == nil {
-		t.logger.Printf("resource PRF for unknown link_id %x", p.DestHash[:4])
+		logAt(t.logger, LogInfo, "resource PRF for unknown link_id %x", p.DestHash[:4])
 		return
 	}
 	prf, err := ParseResourceProof(p.Data)
 	if err != nil {
-		t.logger.Printf("resource PRF parse: %v", err)
+		logAt(t.logger, LogInfo, "resource PRF parse: %v", err)
 		return
 	}
 	rs := t.linkManager.lookupResourceSender(link.ID, prf.ResourceHash)

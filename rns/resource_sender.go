@@ -242,7 +242,7 @@ func newResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 
 	// Use linkID to dedup the goroutine-side log prefix; helps when
 	// chasing multiple concurrent transfers in a single log file.
-	logger.Printf("resource sender: link=%x resource=%s parts=%d t=%d d=%d",
+	logAt(logger, LogDebug, "resource sender: link=%x resource=%s parts=%d t=%d d=%d",
 		linkID[:4], ResourceHashShortHex(hash), len(parts), len(wireBlob), len(body))
 
 	return rs, nil
@@ -282,7 +282,7 @@ func (rs *ResourceSender) HandleRequest(req *ResourceRequest) {
 	select {
 	case rs.reqCh <- req:
 	default:
-		rs.logger.Printf("resource sender: REQ channel full for %s — dropping", ResourceHashShortHex(rs.resourceHash))
+		logAt(rs.logger, LogWarn, "resource sender: REQ channel full for %s — dropping", ResourceHashShortHex(rs.resourceHash))
 	}
 }
 
@@ -378,7 +378,7 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 				rs.fail(ErrResourceTimeout)
 				return ErrResourceTimeout
 			}
-			rs.logger.Printf("resource sender: ADV retry %d/%d for %s",
+			logAt(rs.logger, LogDebug, "resource sender: ADV retry %d/%d for %s",
 				advRetries, MaxAdvRetries, ResourceHashShortHex(rs.resourceHash))
 			if err := rs.broadcastAdv(); err != nil {
 				rs.fail(err)
@@ -412,7 +412,7 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 				// RESOURCE_HMU (SPEC §10.7). A sequencing error here is
 				// unrecoverable, so it fails the transfer.
 				if err := rs.serveHmu(req); err != nil {
-					rs.logger.Printf("resource sender: serve HMU for %s: %v",
+					logAt(rs.logger, LogWarn, "resource sender: serve HMU for %s: %v",
 						ResourceHashShortHex(rs.resourceHash), err)
 					rs.fail(err)
 					return err
@@ -430,7 +430,7 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 				return err
 			}
 			rs.state.Store(int32(ResourceStateComplete))
-			rs.logger.Printf("resource sender: complete link=%x resource=%s parts=%d",
+			logAt(rs.logger, LogInfo, "resource sender: complete link=%x resource=%s parts=%d",
 				rs.link.ID[:4], ResourceHashShortHex(rs.resourceHash), expectedParts)
 			return nil
 		}
@@ -478,7 +478,7 @@ func (rs *ResourceSender) fulfillRequest(req *ResourceRequest) (int, error) {
 	for _, mh := range req.RequestedMap {
 		idx := rs.findPartByMapHash(mh)
 		if idx < 0 {
-			rs.logger.Printf("resource sender: REQ asks for unknown map_hash %x — skipping", mh)
+			logAt(rs.logger, LogInfo, "resource sender: REQ asks for unknown map_hash %x — skipping", mh)
 			continue
 		}
 		pkt, err := buildResourceCtxPacket(rs.link.ID, rs.parts[idx], ContextResource, false)
@@ -550,7 +550,7 @@ func (rs *ResourceSender) serveHmu(req *ResourceRequest) error {
 	if err != nil {
 		return err
 	}
-	rs.logger.Printf("resource sender: HMU segment=%d entries=%d for %s",
+	logAt(rs.logger, LogDebug, "resource sender: HMU segment=%d entries=%d for %s",
 		segment, end-start, ResourceHashShortHex(rs.resourceHash))
 	return rs.transport.Broadcast(pkt)
 }
