@@ -68,6 +68,12 @@ type Transport struct {
 	// hex dest_hash. See PinDestinations.
 	pinned map[string]struct{}
 
+	// heard records when each destination last announced, for the
+	// announce LOG only, keyed by raw dest_hash and holding unix seconds.
+	// Guarded by mu. It outlives eviction from `known` on purpose; see
+	// AnnounceLogMemory for why the log cannot rely on `known` alone.
+	heard map[[IdentityHashLen]byte]int64
+
 	// retransmitSlots caps concurrent retransmit goroutines spawned by
 	// broadcastWithRetransmits (one per inbound LINKREQUEST / path
 	// request / link DATA).
@@ -117,6 +123,27 @@ const PathRequestDedupWindow = 60 * time.Second
 // link state, errors). Above the threshold we still log once so absence-
 // then-return is visible.
 const AnnounceLogReturnThreshold = 6 * time.Hour
+
+// AnnounceLogMemory bounds how many destinations the announce log
+// remembers having heard, independently of the identity cache.
+//
+// WHY a second record: the log used to decide "new" from the identity
+// cache alone, and that cache is capped at KnownIdentityCapacity. A busy
+// public hub carries more announcing peers than that (measured: 7,606
+// against 4,096 slots), so peers were evicted between their periodic
+// announces and every return was logged as `announce verified (new)`.
+// The result was a steady info-level flood of peers we had already seen
+// — one operator's journal reached 1.1 GB in three days — and a label
+// that was simply wrong. Remembering only a dest_hash and a timestamp
+// costs ~30 bytes an entry rather than a whole identity, so this can
+// cover several times the cache for well under a megabyte.
+//
+// It is bounded because fresh identities are free to mint. When full, a
+// random entry is dropped: the worst an attacker achieves by flooding it
+// is that some peers get logged as new once more, and that line is
+// rate-limited anyway (see handleAnnounce). Nothing but the log reads
+// this, so its accuracy never affects routing or verification.
+const AnnounceLogMemory = 4 * KnownIdentityCapacity
 
 // PathResponseTagDedupWindow bounds how long we remember an inbound
 // path? request's 16-byte random tag so we don't emit a path-response
@@ -263,6 +290,7 @@ func NewTransport(logger Logger) *Transport {
 	}
 	t := &Transport{
 		known:                map[string]*KnownIdentity{},
+		heard:                map[[IdentityHashLen]byte]int64{},
 		locals:               map[string]*LocalDestination{},
 		pathRequestsSent:     map[string]time.Time{},
 		pathResponseTagsSeen: map[string]time.Time{},
@@ -711,11 +739,23 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	// log decision can tell "new identity" / "returning after a long gap"
 	// from "routine periodic re-announce". Skips the log line for the
 	// common case (a known peer announcing on schedule).
-	wasNewIdentity := prev == nil
+	//
+	// A peer missing from the cache is not necessarily new: it may have
+	// been evicted since it last announced, so fall back to `heard`
+	// (AnnounceLogMemory explains why). Only a peer absent from both is
+	// logged as new.
+	heardBefore := prev != nil
 	var prevLastSeen time.Time
 	if prev != nil {
 		prevLastSeen = prev.LastSeen
 	}
+	var heardKey [IdentityHashLen]byte
+	copy(heardKey[:], a.DestHash)
+	if ts, ok := t.heard[heardKey]; ok && prev == nil {
+		heardBefore = true
+		prevLastSeen = time.Unix(ts, 0)
+	}
+	t.noteHeardLocked(heardKey, now)
 	if prev == nil {
 		// Bound the map: when at capacity, evict the oldest entry —
 		// preferring one that is NOT pinned.
@@ -800,13 +840,19 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	// Keyed on name_hash, not on the shape of app_data (SPEC §4.6): we
 	// listen promiscuously, so most announces here are not LXMF at all
 	// and their app_data decodes to a convincing wrong name.
+	//
+	// Both lines go through the rate limiter. Remembering peers fixes the
+	// churn, but a genuinely new identity costs an attacker nothing to
+	// mint, so without a cap anyone on the hub could still drive this
+	// line at whatever rate they can sign announces. The suppression
+	// summary keeps the volume visible when the cap bites.
 	switch {
-	case wasNewIdentity:
+	case !heardBefore:
 		displayName := LXMFDisplayNameFromAnnounce(a)
-		logAt(t.logger, LogInfo, "announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
+		t.rlog.Limited(LogInfo, "announce-new", "announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
 	case now.Sub(prevLastSeen) >= AnnounceLogReturnThreshold:
 		displayName := LXMFDisplayNameFromAnnounce(a)
-		logAt(t.logger, LogInfo, "announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
+		t.rlog.Limited(LogInfo, "announce-returning", "announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
 	}
 	for _, h := range handlers {
 		if h.AspectMatch(a.NameHash) {
@@ -1963,6 +2009,21 @@ func (t *Transport) PinnedCount() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return len(t.pinned)
+}
+
+// noteHeardLocked records that dest announced at now, for the announce
+// log. When the record is full and dest is not already in it, one
+// arbitrary entry is dropped first. That is O(1), unlike an oldest-first
+// scan, and the accuracy is enough for a log label. Callers must hold
+// t.mu for writing.
+func (t *Transport) noteHeardLocked(dest [IdentityHashLen]byte, now time.Time) {
+	if _, ok := t.heard[dest]; !ok && len(t.heard) >= AnnounceLogMemory {
+		for victim := range t.heard {
+			delete(t.heard, victim)
+			break
+		}
+	}
+	t.heard[dest] = now.Unix()
 }
 
 // oldestEvictableLocked returns the map key of the entry to evict:
