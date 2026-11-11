@@ -3,8 +3,10 @@ package rns
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -618,5 +620,146 @@ func TestPinReleaseOnRemoval(t *testing.T) {
 	}
 	if tr.Recall(dest) != nil {
 		t.Error("released peer still protected from eviction")
+	}
+}
+
+// announceLines returns the logged announce-verified lines for dest.
+func announceLines(rec *recordingLeveledLogger, dest []byte) []string {
+	var out []string
+	needle := fmt.Sprintf("dest=%x ", dest[:4])
+	for _, r := range rec.got {
+		if strings.HasPrefix(r.line, "announce verified") && strings.Contains(r.line, needle) {
+			out = append(out, r.line)
+		}
+	}
+	return out
+}
+
+// TestEvictedPeerIsNotLoggedAsNew is the regression for the journal
+// flood: on a hub with more peers than the identity cache holds, a peer
+// evicted between its periodic announces was logged as
+// `announce verified (new)` every time it came back.
+func TestEvictedPeerIsNotLoggedAsNew(t *testing.T) {
+	rec := &recordingLeveledLogger{}
+	tr := NewTransport(rec)
+
+	id, pkt := makePinTestAnnounce(t)
+	dest := id.DestinationHashFor(FullName("lxmf", "delivery"))
+	tr.handleAnnounce(pkt)
+	if got := announceLines(rec, dest); len(got) != 1 || !strings.Contains(got[0], "(new)") {
+		t.Fatalf("first announce logged %q, want one (new) line", got)
+	}
+
+	for i := 0; i < KnownIdentityCapacity+8; i++ {
+		_, p := makePinTestAnnounce(t)
+		tr.handleAnnounce(p)
+	}
+	if tr.Recall(dest) != nil {
+		t.Fatal("peer was not evicted; the test is not exercising churn")
+	}
+
+	// Start from a clean log and an unspent rate limit, so an absent
+	// line means "not logged", not "suppressed by the flood above".
+	rec.got = nil
+	tr.rlog.counters = map[string]*logCounter{}
+
+	again, err := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.handleAnnounce(again)
+	if tr.Recall(dest) == nil {
+		t.Fatal("returning peer was not re-cached")
+	}
+	if got := announceLines(rec, dest); len(got) != 0 {
+		t.Errorf("evicted peer re-announcing on schedule logged %q, want nothing", got)
+	}
+
+	// After a long silence it is still reported, as returning.
+	tr.mu.Lock()
+	tr.known[hex.EncodeToString(dest)].LastSeen = time.Now().Add(-AnnounceLogReturnThreshold - time.Minute)
+	tr.mu.Unlock()
+	late, err := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.handleAnnounce(late)
+	if got := announceLines(rec, dest); len(got) != 1 || !strings.Contains(got[0], "(returning after") {
+		t.Errorf("long-silent peer logged %q, want one (returning after …) line", got)
+	}
+}
+
+// TestEvictedPeerReturningAfterSilence: the gap for an evicted peer comes
+// from the heard record, so a long absence is still reported as a return
+// rather than lost along with the cache entry.
+func TestEvictedPeerReturningAfterSilence(t *testing.T) {
+	rec := &recordingLeveledLogger{}
+	tr := NewTransport(rec)
+	id, _ := makePinTestAnnounce(t)
+	dest := id.DestinationHashFor(FullName("lxmf", "delivery"))
+
+	var key [IdentityHashLen]byte
+	copy(key[:], dest)
+	tr.mu.Lock()
+	tr.heard[key] = time.Now().Add(-AnnounceLogReturnThreshold - time.Hour).Unix()
+	tr.mu.Unlock()
+
+	pkt, err := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.handleAnnounce(pkt)
+	if got := announceLines(rec, dest); len(got) != 1 || !strings.Contains(got[0], "(returning after") {
+		t.Errorf("logged %q, want one (returning after …) line", got)
+	}
+}
+
+// TestNewAnnounceLogIsRateLimited: fresh identities cost nothing to mint,
+// so the (new) line must be capped regardless of how many arrive.
+func TestNewAnnounceLogIsRateLimited(t *testing.T) {
+	rec := &recordingLeveledLogger{}
+	tr := NewTransport(rec)
+	for i := 0; i < 50; i++ {
+		_, p := makePinTestAnnounce(t)
+		tr.handleAnnounce(p)
+	}
+	n := 0
+	for _, r := range rec.got {
+		if strings.HasPrefix(r.line, "announce verified (new)") {
+			if r.level != LogInfo {
+				t.Errorf("(new) line at %v, want info", r.level)
+			}
+			n++
+		}
+	}
+	if n != defaultLogBurst {
+		t.Errorf("50 fresh identities logged %d (new) lines, want the burst of %d", n, defaultLogBurst)
+	}
+}
+
+// TestHeardRecordIsBounded: the heard record must not grow past
+// AnnounceLogMemory however many identities announce.
+func TestHeardRecordIsBounded(t *testing.T) {
+	tr := NewTransport(nil)
+	tr.mu.Lock()
+	for i := 0; len(tr.heard) < AnnounceLogMemory; i++ {
+		var k [IdentityHashLen]byte
+		binary.BigEndian.PutUint64(k[:], uint64(i))
+		tr.heard[k] = time.Now().Unix()
+	}
+	tr.mu.Unlock()
+
+	id, pkt := makePinTestAnnounce(t)
+	tr.handleAnnounce(pkt)
+
+	var key [IdentityHashLen]byte
+	copy(key[:], id.DestinationHashFor(FullName("lxmf", "delivery")))
+	tr.mu.RLock()
+	defer tr.mu.RUnlock()
+	if len(tr.heard) != AnnounceLogMemory {
+		t.Errorf("heard holds %d entries, want exactly the cap %d", len(tr.heard), AnnounceLogMemory)
+	}
+	if _, ok := tr.heard[key]; !ok {
+		t.Error("newly heard peer was not recorded when the record was full")
 	}
 }
