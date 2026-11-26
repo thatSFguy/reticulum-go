@@ -941,21 +941,21 @@ func isPathRequestDestHash(b []byte) bool {
 // prevents responding twice if the same request reaches us via
 // multiple relays.
 func (t *Transport) handlePathRequest(p *Packet) {
-	target, err := PathRequestTarget(p.Data)
+	// SPEC §7.2.1: only the 32-, 48- and 64-byte forms are valid, and the
+	// tag sits at [16:32] or [32:48]. It is NOT the trailing 16 bytes: on
+	// the 64-byte form those are the stamp extension, which on every
+	// relayed unstamped request is the same 0xC1 0xFF placeholder, so
+	// deduping on them suppressed every such request after the first.
+	// Stamps are not checked: upstream does not enforce them by default,
+	// and a leaf answering for its own destinations MAY skip validation
+	// (SPEC §7.2 rule 3).
+	req, err := ParsePathRequest(p.Data)
 	if err != nil {
 		return
 	}
-	// The tag is the TRAILING 16 bytes of the request body. SPEC §7.2.1
-	// has two forms: the leaf form `target(16) || tag(16)` (32 B) and
-	// the transport-originator form `target(16) || transport_id(16) ||
-	// tag(16)` (48 B). Slicing a fixed [16:32] would mistake the
-	// transport_id for the tag on the 48-byte form and dedup on the
-	// wrong bytes — take the last 16 instead.
-	if len(p.Data) < IdentityHashLen*2 {
-		return // no tag, malformed request
-	}
-	tag := p.Data[len(p.Data)-IdentityHashLen:]
-	tagKey := hex.EncodeToString(tag)
+	target, tag := req.Target, req.Tag
+	// unique_tag = destination_hash || tag (SPEC §7.2.2).
+	tagKey := hex.EncodeToString(target) + hex.EncodeToString(tag)
 
 	// RELEVANCE FIRST. On a shared public hub the overwhelming majority
 	// of path requests target other people, and the dedup bookkeeping

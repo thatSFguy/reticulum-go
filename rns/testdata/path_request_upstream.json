@@ -1,0 +1,43 @@
+{
+  "_about": "SPEC \u00a77.2.1 path-request payloads and upstream Transport.parse_path_request results; stamp from Transport.stamp_path_request.",
+  "rns_version_at_generation": "1.6.1",
+  "pr_cost": 15.8,
+  "cases": [
+    {
+      "name": "stamped",
+      "payload_hex": "34a04005bcaf206eec990bd9637d9fdbed61d2803a65daddf2573d2fb53c1e062a1073a6e67f0e5f09a5957c659503c6c100a21b8c4501ca1889ac8e4a7ca166",
+      "target_hex": "34a04005bcaf206eec990bd9637d9fdb",
+      "transport_id_hex": "ed61d2803a65daddf2573d2fb53c1e06",
+      "tag_hex": "2a1073a6e67f0e5f09a5957c659503c6",
+      "ext_hex": "c100a21b8c4501ca1889ac8e4a7ca166",
+      "stamp_valid_at_pr_cost": true
+    },
+    {
+      "name": "relayed_placeholder",
+      "payload_hex": "34a04005bcaf206eec990bd9637d9fdbed61d2803a65daddf2573d2fb53c1e062a1073a6e67f0e5f09a5957c659503c6c1ff0000000000000000000000000000",
+      "target_hex": "34a04005bcaf206eec990bd9637d9fdb",
+      "transport_id_hex": "ed61d2803a65daddf2573d2fb53c1e06",
+      "tag_hex": "2a1073a6e67f0e5f09a5957c659503c6",
+      "ext_hex": "c1ff0000000000000000000000000000",
+      "stamp_valid_at_pr_cost": false
+    },
+    {
+      "name": "unstamped",
+      "payload_hex": "34a04005bcaf206eec990bd9637d9fdbed61d2803a65daddf2573d2fb53c1e062a1073a6e67f0e5f09a5957c659503c6",
+      "target_hex": "34a04005bcaf206eec990bd9637d9fdb",
+      "transport_id_hex": "ed61d2803a65daddf2573d2fb53c1e06",
+      "tag_hex": "2a1073a6e67f0e5f09a5957c659503c6",
+      "ext_hex": "",
+      "stamp_valid_at_pr_cost": false
+    },
+    {
+      "name": "legacy",
+      "payload_hex": "34a04005bcaf206eec990bd9637d9fdb2a1073a6e67f0e5f09a5957c659503c6",
+      "target_hex": "34a04005bcaf206eec990bd9637d9fdb",
+      "transport_id_hex": "",
+      "tag_hex": "2a1073a6e67f0e5f09a5957c659503c6",
+      "ext_hex": "",
+      "stamp_valid_at_pr_cost": false
+    }
+  ]
+}
